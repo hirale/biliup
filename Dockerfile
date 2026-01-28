@@ -1,13 +1,13 @@
 # Build biliup's web-ui
 FROM node:lts AS webui-builder
-ARG repo_url=https://github.com/biliup/biliup
+ARG repo_url=https://github.com/hirale/biliup
 ARG branch_name=master
 
 COPY . /biliup
 
 RUN set -eux; \
 	\
-	if [ ! -f /biliup/biliup.spec ]; then \
+	if [ ! -f /hirale/biliup.spec ]; then \
 	rm -rf /biliup; \
 	git clone --depth 1 --branch "$branch_name" "$repo_url" /biliup; \
 	fi;
@@ -21,7 +21,7 @@ RUN set -eux; \
 
 # Build biliup's python wheel
 FROM rust:latest AS wheel-builder
-ARG repo_url=https://github.com/biliup/biliup
+ARG repo_url=https://github.com/hirale/biliup
 ARG branch_name=master
 
 COPY . /biliup
@@ -31,7 +31,7 @@ RUN set -eux; \
 	apt-get update; \
 	apt-get install -y --no-install-recommends python3-pip g++; \
 	pip3 install maturin --break-system-packages; \
-	if [ ! -f /biliup/biliup.spec ]; then \
+	if [ ! -f /hirale/biliup.spec ]; then \
 	rm -rf /biliup; \
 	git clone --depth 1 --branch "$branch_name" "$repo_url" /biliup; \
 	fi;
