@@ -19,6 +19,7 @@ impl FromStr for SubmitOption {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
             "app" => Ok(SubmitOption::App),
+            "web" => Ok(SubmitOption::Web),
             "bcutandroid" | "b-cut-android" | "bcut_android" => Ok(SubmitOption::BCutAndroid),
             _ => Err(format!("Unknown submit option: {}", s)),
         }
