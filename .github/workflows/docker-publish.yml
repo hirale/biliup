@@ -18,7 +18,7 @@ permissions:
   packages: write
 
 env:
-  IMAGE_NAME: ghcr.io/biliup/caution
+  IMAGE_NAME: ghcr.io/hirale/biliup
 
 jobs:
   # Run tests.
