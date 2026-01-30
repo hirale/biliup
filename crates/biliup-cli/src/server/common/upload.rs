@@ -62,11 +62,13 @@ where
             .clone();
         recorder.filename_prefix = upload_config.title.clone();
 
+        let use_live_cover = ctx.config().use_live_cover.unwrap_or_default();
         let studio = build_studio(
             &upload_config,
             &upload_context.bilibili,
             uploaded_videos.videos,
             &recorder,
+            use_live_cover,
         )
         .await?;
         let submit_api = ctx.config().submit_api.clone();
@@ -239,13 +241,26 @@ pub(crate) async fn build_studio(
     bilibili: &BiliBili,
     videos: Vec<Video>,
     recorder: &Recorder,
+    use_live_cover: bool,
 ) -> AppResult<Studio> {
     // 使用 Builder 模式简化构建
     let mut studio: Studio = Studio::builder()
         .desc(recorder.format(&upload_config.description.clone().unwrap_or_default()))
         .maybe_dtime(upload_config.dtime)
         .maybe_copyright(upload_config.copyright)
-        .cover(upload_config.cover_path.clone().unwrap_or_default())
+        .cover(
+            upload_config
+                .cover_path
+                .clone()
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| {
+                    if use_live_cover {
+                        recorder.streamer_info.live_cover_path.clone()
+                    } else {
+                        String::new()
+                    }
+                }),
+        )
         .dynamic(upload_config.dynamic.clone().unwrap_or_default())
         .source(
             upload_config
