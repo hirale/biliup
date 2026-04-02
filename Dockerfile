@@ -7,7 +7,7 @@ COPY . /biliup
 
 RUN set -eux; \
 	\
-	if [ ! -f /hirale/biliup.spec ]; then \
+	if [ ! -f /biliup/biliup.spec ]; then \
 	rm -rf /biliup; \
 	git clone --depth 1 --branch "$branch_name" "$repo_url" /biliup; \
 	fi;
@@ -31,7 +31,7 @@ RUN set -eux; \
 	apt-get update; \
 	apt-get install -y --no-install-recommends python3-pip g++; \
 	pip3 install maturin --break-system-packages; \
-	if [ ! -f /hirale/biliup.spec ]; then \
+	if [ ! -f /biliup/biliup.spec ]; then \
 	rm -rf /biliup; \
 	git clone --depth 1 --branch "$branch_name" "$repo_url" /biliup; \
 	fi;
@@ -56,6 +56,7 @@ VOLUME /opt
 
 # 需要遵守 wheel 文件名规范
 COPY --from=wheel-builder /biliup/target/wheels/* /tmp/
+COPY --from=wheel-builder /biliup/scripts /opt/scripts
 
 RUN set -eux; \
 	\
@@ -71,22 +72,23 @@ RUN set -eux; \
 	useApt=false; \
 	apt-get update; \
 	apt-get install -y --no-install-recommends \
+		bash \
 		wget \
 		curl \
 		xz-utils \
 		g++ \
 	; \
 	apt-mark auto '.*' > /dev/null; \
-	apt-mark manual curl wget; \
+	apt-mark manual bash curl wget; \
 	\
 	arch="$(dpkg --print-architecture)"; arch="${arch##*-}"; \
-	url='https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n8.0-latest-'; \
+	url='https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n8.1-latest-'; \
 	case "$arch" in \
 		'amd64') \
-			url="${url}linux64-gpl-8.0.tar.xz"; \
+			url="${url}linux64-gpl-8.1.tar.xz"; \
 		;; \
 		'arm64') \
-			url="${url}linuxarm64-gpl-8.0.tar.xz"; \
+			url="${url}linuxarm64-gpl-8.1.tar.xz"; \
 		;; \
 		*) \
 			useApt=true; \
