@@ -91,9 +91,10 @@ fi
 
 temp_dir=$(mktemp -d "${TMPDIR:-/tmp}/biliup-flv-to-mp3-XXXXXX")
 concat_list="$temp_dir/concat.txt"
-merged_flv="$temp_dir/merged.flv"
+output_part="${output_file}.part.mp3"
 
 cleanup() {
+  rm -f "$output_part"
   rm -rf "$temp_dir"
 }
 
@@ -103,19 +104,13 @@ for path in "${sorted_paths[@]}"; do
   printf "file '%s'\n" "$(escape_for_concat "$path")" >>"$concat_list"
 done
 
-log "Merging ${#sorted_paths[@]} FLV file(s)"
+log "Converting ${#sorted_paths[@]} ordered FLV file(s) to MP3: $output_file"
 if ! ffmpeg -hide_banner -loglevel error -y \
   -f concat -safe 0 -i "$concat_list" \
-  -c copy "$merged_flv"; then
-  fail "failed to merge FLV segments"
+  -vn -map 0:a:0 -c:a libmp3lame -q:a 2 \
+  "$output_part"; then
+  fail "failed to convert ordered FLV segments to MP3"
 fi
 
-log "Converting merged FLV to MP3: $output_file"
-if ! ffmpeg -hide_banner -loglevel error -y \
-  -i "$merged_flv" \
-  -vn -map a:0 -c:a libmp3lame -q:a 2 \
-  "$output_file"; then
-  fail "failed to convert merged FLV to MP3"
-fi
-
+mv "$output_part" "$output_file"
 log "MP3 saved to: $output_file"
