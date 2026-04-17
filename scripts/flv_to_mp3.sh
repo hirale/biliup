@@ -38,15 +38,27 @@ escape_for_concat() {
 # Returns the audio duration in seconds for a file, or 0 on failure.
 probe_duration() {
   local file="$1"
-  local dur
+  local dur raw hours minutes seconds
 
-  dur=$(ffprobe -v quiet -select_streams a:0 \
-    -show_entries stream=duration \
-    -of csv=p=0 "$file" 2>/dev/null | head -1 || true)
-  if [[ -z "$dur" || "$dur" == "N/A" ]]; then
-    dur=$(ffprobe -v quiet \
-      -show_entries format=duration \
+  if [[ "$has_ffprobe" -eq 1 ]]; then
+    dur=$(ffprobe -v quiet -select_streams a:0 \
+      -show_entries stream=duration \
       -of csv=p=0 "$file" 2>/dev/null | head -1 || true)
+    if [[ -z "$dur" || "$dur" == "N/A" ]]; then
+      dur=$(ffprobe -v quiet \
+        -show_entries format=duration \
+        -of csv=p=0 "$file" 2>/dev/null | head -1 || true)
+    fi
+  fi
+
+  if [[ -z "$dur" || "$dur" == "N/A" ]]; then
+    raw=$(ffmpeg -hide_banner -i "$file" 2>&1 || true)
+    dur=$(printf '%s\n' "$raw" | awk -F 'Duration: |, start:' '/Duration: / {print $2; exit}' || true)
+
+    if [[ -n "$dur" ]]; then
+      IFS=: read -r hours minutes seconds <<<"$dur"
+      dur=$(awk "BEGIN{printf \"%.3f\", ($hours * 3600) + ($minutes * 60) + $seconds}")
+    fi
   fi
 
   printf '%s' "${dur:-0}"
@@ -118,28 +130,14 @@ convert_segment_by_segment() {
   verify_duration "$total_input_seconds" "$output_part" "Fallback output"
 }
 
-write_source_manifest() {
-  local manifest="$1"
-  local path
-
-  : >"$manifest"
-  for path in "${sorted_paths[@]}"; do
-    printf '%s\n' "$path" >>"$manifest"
-  done
-}
-
-archive_sources() {
-  local manifest="$1"
-  local archive="$2"
-
-  write_source_manifest "$manifest"
-  log "Archiving original FLV segments to: $archive"
-  tar -C / -cf "$archive" "${sorted_paths[@]#/}"
-}
-
 command -v ffmpeg >/dev/null 2>&1 || fail "ffmpeg is required but was not found in PATH"
-command -v ffprobe >/dev/null 2>&1 || fail "ffprobe is required but was not found in PATH"
-command -v tar >/dev/null 2>&1 || fail "tar is required but was not found in PATH"
+
+has_ffprobe=0
+if command -v ffprobe >/dev/null 2>&1; then
+  has_ffprobe=1
+else
+  log "ffprobe not found; falling back to ffmpeg duration probing"
+fi
 
 target_dir=${1:-audio}
 mkdir -p "$target_dir"
@@ -193,10 +191,6 @@ if [[ -e "$output_file" ]]; then
   output_file="$target_dir/${output_stem}_${timestamp}.mp3"
 fi
 
-output_base="${output_file%.mp3}"
-source_manifest="${output_base}_sources.txt"
-source_archive="${output_base}_sources.tar"
-
 temp_dir=$(mktemp -d "${TMPDIR:-/tmp}/biliup-flv-to-mp3-XXXXXX")
 concat_list="$temp_dir/concat.txt"
 output_part="${output_file}.part.mp3"
@@ -225,10 +219,6 @@ if ! convert_all_at_once; then
   if ! convert_segment_by_segment; then
     fail "failed to convert ordered FLV segments to MP3 without truncation"
   fi
-fi
-
-if ! archive_sources "$source_manifest" "$source_archive"; then
-  fail "failed to archive original FLV segments"
 fi
 
 mv "$output_part" "$output_file"
