@@ -38,7 +38,7 @@ escape_for_concat() {
 # Returns the audio duration in seconds for a file, or 0 on failure.
 probe_duration() {
   local file="$1"
-  local dur raw hours minutes seconds
+  local dur="" raw hours minutes seconds
 
   if [[ "$has_ffprobe" -eq 1 ]]; then
     dur=$(ffprobe -v quiet -select_streams a:0 \
