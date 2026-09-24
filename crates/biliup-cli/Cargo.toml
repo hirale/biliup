@@ -11,12 +11,25 @@ path = "src/main.rs"
 
 [dependencies]
 biliup = { path = "../biliup", features = ["cli"] }
+danmaku-client = { package = "danmaku", path = "../danmaku" }
+
+# mesio（rust-srec）：进程内 FLV/HLS 下载 + 修复管线，见 server/core/downloader/mesio.rs
+mesio-engine = { git = "https://github.com/hua0512/rust-srec", rev = "dcdb80ee607ff6a991e5ddd86a0084a01bd945ac" }
+flv-fix = { git = "https://github.com/hua0512/rust-srec", rev = "dcdb80ee607ff6a991e5ddd86a0084a01bd945ac", default-features = false }
+hls-fix = { git = "https://github.com/hua0512/rust-srec", rev = "dcdb80ee607ff6a991e5ddd86a0084a01bd945ac", default-features = false }
+hls = { git = "https://github.com/hua0512/rust-srec", rev = "dcdb80ee607ff6a991e5ddd86a0084a01bd945ac" }
+# 直播预览要把 mesio 管线里的 FlvData 重新编成字节，需要直接引用 flv 的类型（同一 rev，已在 lock 中）
+flv = { git = "https://github.com/hua0512/rust-srec", rev = "dcdb80ee607ff6a991e5ddd86a0084a01bd945ac" }
+pipeline-common = { git = "https://github.com/hua0512/rust-srec", rev = "dcdb80ee607ff6a991e5ddd86a0084a01bd945ac" }
 
 serde = { workspace = true }
 serde_json = { workspace = true }
-tokio = { workspace = true }
+serde_yaml = { workspace = true }
+toml = { workspace = true }
+tokio = { workspace = true, features = ["io-std"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter"] }  # 添加特性（特性是累加的）  }
+tracing-appender = { workspace = true }
 thiserror = { workspace = true }
 rand = { workspace = true }
 serde_urlencoded = { workspace = true }
@@ -39,7 +52,10 @@ tower-http = { version = "0.6.2", features = ["fs", "cors"] }
 reqwest = { workspace = true }
 sqlx = { version = "0.8", features = [ "runtime-tokio-rustls", "sqlite" ] }
 regex = { workspace = true }
-serde_yaml = { workspace = true }
+base64 = "0.22"
+md-5 = "0.10.6"
+libsm = "0.6.0"
+urlencoding = "2.1.3"
 tempfile = "3.14"
 rust-embed = "8.7.2"
 mime_guess = "2.0.5"
@@ -62,7 +78,5 @@ struct-patch = "0.10.4"
 shellexpand = "3.1"
 dirs = "6.0"
 
-[features]
-default = []
-python-bridge = []
-
+[dev-dependencies]
+m3u8-rs = "6"

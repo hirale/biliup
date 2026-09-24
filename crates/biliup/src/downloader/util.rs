@@ -1,11 +1,36 @@
 use chrono::{DateTime, Local};
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use std::time::Duration;
 use tracing::{error, info};
 
-use super::extractor::CallbackFn;
+pub type CallbackFn<'a> = Box<dyn FnMut(&str) + Send + Sync + 'a>;
+
+/// 已写盘字节的原子累计，供录制线程之外（如 Web 接口）读取实时速率。
+///
+/// 写盘路径上只做一次 `fetch_add`：不加锁、不 await、不会失败，
+/// 因此不改变录制的任何控制流。`Clone` 得到的是同一计数器的另一个句柄。
+#[derive(Debug, Clone, Default)]
+pub struct ByteCounter(Arc<AtomicU64>);
+
+impl ByteCounter {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    #[inline]
+    pub fn add(&self, bytes: u64) {
+        self.0.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    pub fn total(&self) -> u64 {
+        self.0.load(Ordering::Relaxed)
+    }
+}
 
 #[derive(Debug)]
 pub enum Segment {
@@ -62,10 +87,14 @@ impl Segmentable {
         result
     }
 
+    fn elapsed_time(&self) -> Duration {
+        self.time.current.saturating_sub(self.time.start)
+    }
+
     /// 检查单独的时间条件
     pub fn time_needed(&self) -> bool {
         if let Some(expected_time) = self.time.expected {
-            (self.time.current - self.time.start) >= expected_time
+            self.elapsed_time() >= expected_time
         } else {
             false
         }
@@ -86,7 +115,7 @@ impl Segmentable {
             (true, true) => {
                 tracing::info!(
                     "Segmentation needed: Both time ({:?} >= {:?}) and size ({} >= {}) conditions met",
-                    self.time.current - self.time.start,
+                    self.elapsed_time(),
                     self.time.expected.unwrap(),
                     self.size.current,
                     self.size.expected.unwrap()
@@ -95,7 +124,7 @@ impl Segmentable {
             (true, false) => {
                 tracing::info!(
                     "Segmentation needed: Time condition met ({:?} >= {:?})",
-                    self.time.current - self.time.start,
+                    self.elapsed_time(),
                     self.time.expected.unwrap()
                 );
             }
@@ -188,7 +217,7 @@ impl Segmentable {
     pub fn get_status(&self) -> String {
         let time_info = Self::format_progress(
             "Time",
-            (self.time.current - self.time.start).as_secs_f64(),
+            self.elapsed_time().as_secs_f64(),
             self.time.expected.map(|d| d.as_secs_f64()),
             "s",
             |t| format!("{:.1}", t),
@@ -228,6 +257,8 @@ pub struct LifecycleFile<'a> {
     pub path: PathBuf,
     pub hook: CallbackFn<'a>,
     pub extension: &'static str,
+    /// 写入这一系列分段文件的字节累计（跨分段，不随 `create_new` 归零）。
+    pub bytes_written: ByteCounter,
 }
 
 impl<'a> LifecycleFile<'a> {
@@ -245,7 +276,14 @@ impl<'a> LifecycleFile<'a> {
             path: Default::default(),
             hook: Box::new(hook),
             extension,
+            bytes_written: ByteCounter::new(),
         }
+    }
+
+    /// 让写盘字节累计到调用方持有的计数器上（例如按录制任务汇总速率）。
+    pub fn with_counter(mut self, counter: ByteCounter) -> Self {
+        self.bytes_written = counter;
+        self
     }
 
     pub fn create(&mut self) -> Result<&Path, std::io::Error> {
@@ -278,6 +316,19 @@ impl<'a> LifecycleFile<'a> {
             }
         }
     }
+
+    /// 结束当前分段：先把 `writer` 缓冲的数据写进文件并检查错误，再去掉 `.part` 后缀、触发钩子，
+    /// 钩子（上传、`FileValidator`）看到的文件大小即最终大小。
+    ///
+    /// flush 失败（如盘满）时，已经写进文件的部分照常改名交给钩子，不留下没人处理的 `.part`；
+    /// 错误返回给调用方。
+    pub fn finish(&mut self, writer: &mut impl Write) -> std::io::Result<()> {
+        let flushed = writer.flush().map_err(|e| {
+            std::io::Error::new(e.kind(), format!("flush {}: {e}", self.path.display()))
+        });
+        self.rename();
+        flushed
+    }
 }
 
 pub fn format_filename(file_name: &str) -> String {
@@ -304,6 +355,50 @@ mod tests {
         assert_eq!(Path::new("/feel/the"), p.as_path());
 
         Ok(())
+    }
+
+    #[test]
+    fn byte_counter_clones_share_one_total() {
+        let counter = ByteCounter::new();
+        let handle = counter.clone();
+        counter.add(10);
+        handle.add(5);
+        assert_eq!(counter.total(), 15);
+        assert_eq!(handle.total(), 15);
+
+        let file = LifecycleFile::new("x", "flv").with_counter(counter.clone());
+        file.bytes_written.add(1);
+        assert_eq!(counter.total(), 16);
+    }
+
+    /// flush 失败时不再静默：错误返回给调用方，已写入的部分照常改名交给钩子。
+    #[test]
+    fn finish_reports_a_failed_flush_and_still_hands_the_file_over() {
+        struct FullDisk;
+        impl std::io::Write for FullDisk {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::ErrorKind::StorageFull.into())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Err(std::io::ErrorKind::StorageFull.into())
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let hooked: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
+        let mut file = LifecycleFile::with_hook(dir.path().join("rec").to_str().unwrap(), "flv", {
+            let hooked = hooked.clone();
+            move |name: &str| hooked.lock().unwrap().push(name.to_string())
+        });
+        let part = file.create().unwrap().to_path_buf();
+        fs::write(&part, b"FLV").unwrap();
+
+        let err = file.finish(&mut FullDisk).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::StorageFull);
+        assert!(err.to_string().contains("rec.flv.part"), "{err}");
+        assert!(!part.exists());
+        assert_eq!(*hooked.lock().unwrap(), vec![file.file_name.clone()]);
+        assert_eq!(fs::read(&file.file_name).unwrap(), b"FLV");
     }
 
     #[test]

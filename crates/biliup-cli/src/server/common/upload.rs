@@ -3,34 +3,40 @@ use crate::server::common::util::Recorder;
 use crate::server::config::Config;
 use crate::server::core::downloader::SegmentInfo;
 use crate::server::errors::{AppError, AppResult};
-use crate::server::infrastructure::context::{Context, Stage, Worker, WorkerStatus};
+use crate::server::infrastructure::context::{Context, Stage, WorkerStatus};
 use crate::server::infrastructure::models::InsertFileItem;
-use crate::server::infrastructure::models::hook_step::process_video;
+use crate::server::infrastructure::models::hook_step::{
+    HookStep, process_video, process_video_paths,
+};
 use crate::server::infrastructure::models::upload_streamer::UploadStreamer;
 use async_channel::Receiver;
 use biliup::bilibili::{BiliBili, ResponseData, Studio, Video};
 use biliup::client::StatelessClient;
 use biliup::credential::login_by_cookies;
 use biliup::error::Kind;
-use biliup::uploader::line::{Line, Probe};
+use biliup::uploader::line::{Line, Probe, StreamParcel, UploadedStream};
 use biliup::uploader::util::SubmitOption;
 use biliup::uploader::{VideoFile, line};
+use bytes::Bytes;
 use error_stack::ResultExt;
+use futures::Stream;
 use futures::StreamExt;
 use futures::stream::Inspect;
 use ormlite::Insert;
+use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::time::Instant;
 use tokio::pin;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 // 辅助结构体
-struct UploadContext {
-    bilibili: BiliBili,
-    line: Line,
-    threads: usize,
-    client: StatelessClient,
+#[derive(Clone)]
+pub(crate) struct UploadContext {
+    pub(crate) bilibili: BiliBili,
+    pub(crate) line: Line,
+    pub(crate) threads: usize,
+    pub(crate) client: StatelessClient,
 }
 
 #[derive(Default)]
@@ -52,23 +58,30 @@ where
     let upload_context =
         initialize_upload_context(&ctx.config(), &ctx.stateless_client(), upload_config).await?;
 
-    // 2. 流水线处理视频上传
-    let uploaded_videos = pipeline_upload_videos(rx, &upload_context).await?;
+    // 2. 流水线处理视频上传（segment_processor 在每段上传前执行；用于 Remux 等
+    // 在原地改写路径的预处理）
+    let segment_processors: Vec<HookStep> = ctx
+        .live_streamer()
+        .segment_processor
+        .clone()
+        .unwrap_or_default();
+    let uploaded_videos = pipeline_upload_videos(rx, &upload_context, &segment_processors).await?;
 
     // 3. 提交到B站
     if !uploaded_videos.videos.is_empty() {
-        let mut recorder = ctx
-            .recorder(ctx.stream_info_ext().streamer_info.clone())
-            .clone();
+        let mut recorder = ctx.recorder(ctx.streamer_info().clone()).clone();
         recorder.filename_prefix = upload_config.title.clone();
 
-        let use_live_cover = ctx.config().use_live_cover.unwrap_or_default();
+        let upload_config = with_live_cover_fallback(
+            upload_config,
+            &recorder,
+            ctx.config().use_live_cover.unwrap_or_default(),
+        );
         let studio = build_studio(
             &upload_config,
             &upload_context.bilibili,
             uploaded_videos.videos,
             &recorder,
-            use_live_cover,
         )
         .await?;
         let submit_api = ctx.config().submit_api.clone();
@@ -83,7 +96,22 @@ where
     Ok(())
 }
 
-async fn initialize_upload_context(
+async fn process_without_upload<F>(
+    rx: Inspect<Receiver<SegmentInfo>, F>,
+    ctx: &Context,
+) -> AppResult<()>
+where
+    F: FnMut(&SegmentInfo),
+{
+    let mut paths = Vec::new();
+    pin!(rx);
+    while let Some(event) = rx.next().await {
+        paths.extend(segment_paths(&event));
+    }
+    execute_postprocessor(paths, ctx).await
+}
+
+pub(crate) async fn initialize_upload_context(
     config: &Config,
     client: &StatelessClient,
     upload_config: &UploadStreamer,
@@ -93,9 +121,15 @@ async fn initialize_upload_context(
         .user_cookie
         .clone()
         .unwrap_or("cookies.json".to_string());
-    let bilibili = login_by_cookies(&cookie_file, None)
-        .await
-        .change_context(AppError::Unknown)?;
+    let bilibili = login_by_cookies(&cookie_file, None).await;
+    let bilibili = match bilibili {
+        Err(Kind::IO(_)) => bilibili.change_context_lazy(|| {
+            AppError::Custom(format!("open cookies file: {cookie_file}"))
+        })?,
+        _ => bilibili.change_context_lazy(|| {
+            AppError::Custom(format!("login by cookies file failed: {cookie_file}"))
+        })?,
+    };
 
     // 获取上传线路
     let line = get_upload_line(&client.client, &config.lines).await?;
@@ -111,46 +145,86 @@ async fn initialize_upload_context(
 async fn get_upload_line(client: &reqwest::Client, line: &str) -> AppResult<Line> {
     let line = match line {
         "bda2" => line::bda2(),
-        "bda" => line::bda(),
         "tx" => line::tx(),
         "txa" => line::txa(),
         "bldsa" => line::bldsa(),
         "alia" => line::alia(),
-        _ => Probe::probe(client).await.unwrap_or_default(),
+        "estx" => line::estx(),
+        "akbd" => line::akbd(),
+        _ => match Probe::probe(client).await {
+            Ok(line) => line,
+            Err(e) => {
+                let fallback = Line::default();
+                warn!(error = %e, ?fallback, "AUTO 线路测速失败，回退到默认线路");
+                fallback
+            }
+        },
     };
     Ok(line)
+}
+
+pub(crate) fn segment_paths(event: &SegmentInfo) -> Vec<PathBuf> {
+    let mut paths = vec![event.prev_file_path.clone()];
+    if let Some(danmaku_file_path) = &event.danmaku_file_path {
+        paths.push(danmaku_file_path.clone());
+    }
+    paths
 }
 
 async fn pipeline_upload_videos<F>(
     rx: Inspect<Receiver<SegmentInfo>, F>,
     context: &UploadContext,
+    segment_processors: &[HookStep],
 ) -> AppResult<UploadedVideos>
 where
     F: FnMut(&SegmentInfo),
 {
-    // let mut desc_v2 = Vec::new();
-    // for credit in context.upload_config.desc_v2_credit {
-    //     desc_v2.push(Credit {
-    //         type_id: credit.type_id,
-    //         raw_text: credit.raw_text,
-    //         biz_id: credit.biz_id,
-    //     });
-    // }
-
     let mut uploaded = UploadedVideos::default();
     pin!(rx);
     // 流式处理后续事件
     while let Some(event) = rx.next().await {
-        let video = upload_single_file(&event.prev_file_path, context).await?;
-        uploaded.videos.push(video);
-        uploaded.paths.push(event.prev_file_path);
-        // 失败的文件不加入路径列表，避免后处理出错
+        // segment_processor 在上传前对路径列表做就地转换（如 Remux .ts→.mp4）。
+        // 单段失败（典型场景：磁盘满让 ffmpeg remux 写头失败）不应拖死整批——
+        // 否则已成功上传的段也无法到达 submit + postprocessor，本地 `rm` 不触发，
+        // 文件越堆越多，磁盘进一步紧张，形成正反馈。
+        let mut paths = segment_paths(&event);
+        if !segment_processors.is_empty()
+            && let Err(e) = process_video_paths(&mut paths, segment_processors).await
+        {
+            error!(
+                file = ?event.prev_file_path,
+                "segment_processor failed, skipping segment: {:?}", e
+            );
+            continue;
+        }
+        let upload_path = paths
+            .first()
+            .cloned()
+            .unwrap_or_else(|| event.prev_file_path.clone());
+        match upload_single_file(&upload_path, context).await {
+            Ok(video) => {
+                uploaded.videos.push(video);
+                // 1.0.7 的 FileInfo(video, danmaku) 语义：上传完成后的 postprocessor
+                // 继续接收本段视频路径和对应弹幕路径。segment_processor 可能已把
+                // 首个视频路径原地替换（例如 Remux .ts→.mp4），因此这里保留转换后的路径集。
+                uploaded.paths.extend(paths);
+            }
+            Err(e) => {
+                error!(
+                    file = ?upload_path,
+                    "upload_single_file failed, skipping segment: {:?}", e
+                );
+            }
+        }
     }
 
     Ok(uploaded)
 }
 
-async fn upload_single_file(file_path: &Path, context: &UploadContext) -> AppResult<Video> {
+pub(crate) async fn upload_single_file(
+    file_path: &Path,
+    context: &UploadContext,
+) -> AppResult<Video> {
     let video_path = file_path;
     let UploadContext {
         bilibili,
@@ -236,41 +310,142 @@ pub async fn submit_to_bilibili(
     Ok(result)
 }
 
+pub async fn edit_to_bilibili(
+    bilibili: &BiliBili,
+    studio: &Studio,
+    submit_api: Option<&str>,
+) -> AppResult<serde_json::Value> {
+    let submit_option = match submit_api {
+        Some(submit) => SubmitOption::from_str(submit).unwrap_or(SubmitOption::App),
+        _ => SubmitOption::App,
+    };
+
+    let result = match submit_option {
+        SubmitOption::Web => bilibili
+            .edit_by_web(studio)
+            .await
+            .change_context(AppError::Unknown)?,
+        _ => bilibili
+            .edit_by_app(studio, None)
+            .await
+            .change_context(AppError::Unknown)?,
+    };
+    info!("Edit successful");
+    Ok(result)
+}
+
+pub(crate) fn aid_from_submit(ret: &ResponseData) -> AppResult<u64> {
+    ret.data
+        .as_ref()
+        .and_then(|v| v.get("aid"))
+        .and_then(|v| v.as_u64().or_else(|| v.as_i64().map(|i| i as u64)))
+        .ok_or_else(|| AppError::Custom("投稿成功但未返回 aid".into()).into())
+}
+
+/// 边录边传：把内存分片流上传到 UPOS。上传并发固定为 3，对齐原 sync-downloader。
+pub(crate) async fn upload_byte_stream_parts<S>(
+    context: &UploadContext,
+    parcel: StreamParcel,
+    stream: S,
+) -> AppResult<UploadedStream>
+where
+    S: Stream<Item = biliup::error::Result<(Bytes, usize)>>,
+{
+    let file_name = parcel.file_name().to_string();
+    let total_size = parcel.total_size();
+    info!("开始流式上传：{file_name} ({total_size} bytes)");
+    info!("线路选择：{:?}", context.line);
+    let instant = Instant::now();
+    let uploaded = parcel
+        .upload_parts(context.client.clone(), 3, stream)
+        .await
+        .change_context(AppError::Unknown)?;
+    let t = instant.elapsed().as_millis().max(1);
+    info!(
+        "Stream parts uploaded: {file_name} => cost {:.2}s, {:.2} MB/s.",
+        t as f64 / 1000.,
+        uploaded.uploaded_size() as f64 / 1000. / t as f64
+    );
+    Ok(uploaded)
+}
+
+pub(crate) async fn complete_byte_stream(uploaded: UploadedStream) -> AppResult<Video> {
+    uploaded.complete().await.change_context(AppError::Unknown)
+}
+
+// 解析投稿的「转载来源」(source) 字段。
+// 前端表单留空时会把 copyright_source 提交为空字符串 `Some("")`，
+// 若直接透传则 B 站接口收到空 source，且不会回退到直播间地址。
+// 这里把 None 以及空白字符串都视作「未填写」，统一回退到直播间地址，
+fn resolve_source(copyright_source: Option<&str>, fallback_url: &str) -> String {
+    match copyright_source.map(str::trim) {
+        Some(s) if !s.is_empty() => s.to_string(),
+        _ => fallback_url.to_string(),
+    }
+}
+
+/// 把配置里的 `dtime` 转成 B 站要求的 10 位 Unix 时间戳。
+///
+/// Web UI / Python 版存的是**延迟秒数**（提交后再等这么久公开），B 站接口要的是绝对时间。
+/// 已经是 Unix 时间戳（≥ 1_000_000_000）的值原样透传，避免 CLI `--dtime` 被加两次。
+pub(crate) fn scheduled_publish_ts(dtime: Option<u32>, now_unix: u64) -> Option<u32> {
+    let value = dtime?;
+    const UNIX_TS_FLOOR: u32 = 1_000_000_000; // 2001-09-09
+    let ts = if value >= UNIX_TS_FLOOR {
+        value as u64
+    } else {
+        now_unix.saturating_add(value as u64)
+    };
+    u32::try_from(ts).ok()
+}
+
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// 模板未设置封面且开启 `use_live_cover` 时，用直播封面代替
+pub(crate) fn with_live_cover_fallback<'a>(
+    upload_config: &'a UploadStreamer,
+    recorder: &Recorder,
+    use_live_cover: bool,
+) -> Cow<'a, UploadStreamer> {
+    let has_cover = upload_config
+        .cover_path
+        .as_deref()
+        .is_some_and(|s| !s.is_empty());
+    let live_cover = &recorder.streamer_info.live_cover_path;
+    if has_cover || !use_live_cover || live_cover.is_empty() {
+        return Cow::Borrowed(upload_config);
+    }
+    let mut config = upload_config.clone();
+    config.cover_path = Some(live_cover.clone());
+    Cow::Owned(config)
+}
+
 pub(crate) async fn build_studio(
     upload_config: &UploadStreamer,
     bilibili: &BiliBili,
     videos: Vec<Video>,
     recorder: &Recorder,
-    use_live_cover: bool,
 ) -> AppResult<Studio> {
     // 使用 Builder 模式简化构建
     let mut studio: Studio = Studio::builder()
         .desc(recorder.format(&upload_config.description.clone().unwrap_or_default()))
-        .maybe_dtime(upload_config.dtime)
+        .maybe_dtime(scheduled_publish_ts(upload_config.dtime, now_unix()))
         .maybe_copyright(upload_config.copyright)
-        .cover(
-            upload_config
-                .cover_path
-                .clone()
-                .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| {
-                    if use_live_cover {
-                        recorder.streamer_info.live_cover_path.clone()
-                    } else {
-                        String::new()
-                    }
-                }),
-        )
+        .cover(upload_config.cover_path.clone().unwrap_or_default())
         .dynamic(upload_config.dynamic.clone().unwrap_or_default())
-        .source(
-            upload_config
-                .copyright_source
-                .clone()
-                .unwrap_or_else(|| recorder.streamer_info.url.clone()),
-        )
+        .source(resolve_source(
+            upload_config.copyright_source.as_deref(),
+            &recorder.streamer_info.url,
+        ))
         .tag(upload_config.tags.join(","))
         .maybe_tid(upload_config.tid)
-        .title(recorder.format_filename())
+        .maybe_tid_v2(upload_config.tid_v2)
+        .title(recorder.format_title())
         .videos(videos)
         .dolby(upload_config.dolby.unwrap_or_default())
         // .lossless_music(upload_config.)
@@ -338,10 +513,18 @@ pub async fn upload(
         Some(UploadLine::Cntx) => line::cntx(),
         Some(UploadLine::Antx) => line::antx(),
         Some(UploadLine::Attx) => line::attx(),
-        // Some(UploadLine::Bda) => line::bda(),
         Some(UploadLine::Txa) => line::txa(),
         Some(UploadLine::Alia) => line::alia(),
-        _ => Probe::probe(&client.client).await.unwrap_or_default(),
+        Some(UploadLine::Estx) => line::estx(),
+        Some(UploadLine::Akbd) => line::akbd(),
+        _ => match Probe::probe(&client.client).await {
+            Ok(line) => line,
+            Err(e) => {
+                let fallback = Line::default();
+                warn!(error = %e, ?fallback, "AUTO 线路测速失败，回退到默认线路");
+                fallback
+            }
+        },
     };
     for video_path in video_paths {
         println!(
@@ -382,6 +565,177 @@ pub async fn upload(
     }
 
     Ok((bilibili, videos))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn segment_paths_keeps_video_only_without_danmaku() {
+        let video = PathBuf::from("segment.ts");
+        let event = SegmentInfo::new(video.clone(), None, None, 0);
+
+        assert_eq!(segment_paths(&event), vec![video]);
+    }
+
+    #[test]
+    fn segment_paths_keeps_video_then_danmaku_when_present() {
+        let video = PathBuf::from("segment.ts");
+        let danmaku = PathBuf::from("segment.xml");
+        let event = SegmentInfo::new(video.clone(), Some(danmaku.clone()), None, 0);
+
+        assert_eq!(segment_paths(&event), vec![video, danmaku]);
+    }
+
+    fn cover_fixture(cover_path: Option<&str>, live_cover: &str) -> (UploadStreamer, Recorder) {
+        let config: UploadStreamer = serde_json::from_value(serde_json::json!({
+            "id": 0,
+            "template_name": "test",
+            "tags": [],
+            "cover_path": cover_path,
+        }))
+        .unwrap();
+        let recorder = Recorder::new(
+            None,
+            crate::server::infrastructure::models::StreamerInfo::new(
+                "name",
+                "https://live.example/1",
+                "title",
+                chrono::Utc::now(),
+                live_cover,
+            ),
+        );
+        (config, recorder)
+    }
+
+    #[test]
+    fn live_cover_fills_empty_cover_when_enabled() {
+        let (config, recorder) = cover_fixture(Some(""), "data/cover/live.jpg");
+        let resolved = with_live_cover_fallback(&config, &recorder, true);
+        assert_eq!(resolved.cover_path.as_deref(), Some("data/cover/live.jpg"));
+    }
+
+    #[test]
+    fn live_cover_ignored_when_disabled_or_template_has_cover() {
+        let (config, recorder) = cover_fixture(None, "data/cover/live.jpg");
+        assert!(matches!(
+            with_live_cover_fallback(&config, &recorder, false),
+            Cow::Borrowed(_)
+        ));
+        let (config, recorder) = cover_fixture(Some("mine.jpg"), "data/cover/live.jpg");
+        let resolved = with_live_cover_fallback(&config, &recorder, true);
+        assert_eq!(resolved.cover_path.as_deref(), Some("mine.jpg"));
+    }
+
+    const LIVE_URL: &str = "https://live.douyin.com/123456";
+
+    #[test]
+    fn resolve_source_falls_back_when_none() {
+        // 配置文件未提供 copyright_source
+        assert_eq!(resolve_source(None, LIVE_URL), LIVE_URL);
+    }
+
+    #[test]
+    fn resolve_source_falls_back_when_empty_string() {
+        // 前端表单留空 -> Some("")，应回退到直播间地址（核心 bug 场景）
+        assert_eq!(resolve_source(Some(""), LIVE_URL), LIVE_URL);
+    }
+
+    #[test]
+    fn resolve_source_falls_back_when_whitespace_only() {
+        // 仅空白同样视作未填写
+        assert_eq!(resolve_source(Some("   "), LIVE_URL), LIVE_URL);
+    }
+
+    #[test]
+    fn resolve_source_keeps_user_value_and_trims() {
+        // 用户填写了真实来源则保留（并去除首尾空白）
+        assert_eq!(
+            resolve_source(Some("  https://b23.tv/abc  "), LIVE_URL),
+            "https://b23.tv/abc"
+        );
+    }
+
+    #[test]
+    fn scheduled_publish_ts_adds_delay_seconds() {
+        // UI 选 4 小时后公开：存 14400，投稿时应写成 now+14400
+        assert_eq!(
+            scheduled_publish_ts(Some(4 * 3600), 1_700_000_000),
+            Some(1_700_000_000 + 4 * 3600)
+        );
+    }
+
+    #[test]
+    fn scheduled_publish_ts_passes_through_unix_timestamp() {
+        assert_eq!(
+            scheduled_publish_ts(Some(1_700_014_400), 1_700_000_000),
+            Some(1_700_014_400)
+        );
+    }
+
+    #[test]
+    fn scheduled_publish_ts_none_stays_none() {
+        assert_eq!(scheduled_publish_ts(None, 1_700_000_000), None);
+    }
+
+    #[test]
+    fn studio_submit_payload_includes_tid_v2_when_set() {
+        // submit_by_app / submit_by_web both POST `.json(studio)`; verify body shape.
+        let studio: Studio = serde_json::from_value(serde_json::json!({
+            "tid": 95,
+            "tid_v2": 2102,
+            "title": "payload",
+            "copyright": 1,
+            "up_selection_reply": false,
+            "up_close_reply": false,
+            "up_close_danmu": false
+        }))
+        .unwrap();
+        let body = serde_json::to_value(&studio).unwrap();
+        assert_eq!(body["tid"], 95);
+        assert_eq!(body["tid_v2"], 2102);
+    }
+
+    #[test]
+    fn studio_submit_payload_omits_tid_v2_for_tid_only() {
+        let studio: Studio = serde_json::from_value(serde_json::json!({
+            "tid": 171,
+            "title": "payload",
+            "copyright": 1,
+            "up_selection_reply": false,
+            "up_close_reply": false,
+            "up_close_danmu": false
+        }))
+        .unwrap();
+        let body = serde_json::to_value(&studio).unwrap();
+        assert_eq!(body["tid"], 171);
+        assert!(body.get("tid_v2").is_none());
+    }
+
+    #[test]
+    fn aid_from_submit_reads_numeric_aid() {
+        let ret: ResponseData = serde_json::from_value(serde_json::json!({
+            "code": 0,
+            "data": {"aid": 12345, "bvid": "BV1xx"},
+            "message": "0",
+            "ttl": 1
+        }))
+        .unwrap();
+        assert_eq!(aid_from_submit(&ret).unwrap(), 12345);
+    }
+
+    #[test]
+    fn aid_from_submit_rejects_missing_data() {
+        let ret: ResponseData = serde_json::from_value(serde_json::json!({
+            "code": 0,
+            "data": {},
+            "message": "0",
+            "ttl": 1
+        }))
+        .unwrap();
+        assert!(aid_from_submit(&ret).is_err());
+    }
 }
 
 /// 上传Actor
@@ -428,12 +782,19 @@ impl UActor {
                     });
                 });
                 let result = match ctx.upload_config() {
+                    Some(config) if config.is_noop_uploader() => {
+                        info!(
+                            uploader = ?config.uploader,
+                            "Skipping upload because uploader is Noop"
+                        );
+                        process_without_upload(inspect, &ctx).await
+                    }
                     Some(config) => process_with_upload(inspect, &ctx, config).await,
                     None => {
                         let mut paths = Vec::new();
                         pin!(inspect);
                         while let Some(event) = inspect.next().await {
-                            paths.push(event.prev_file_path);
+                            paths.extend(segment_paths(&event));
                         }
                         // 无上传配置时，直接执行后处理
                         execute_postprocessor(paths, &ctx).await

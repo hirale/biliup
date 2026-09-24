@@ -3,22 +3,24 @@ members = [
     "crates/biliup",
     "crates/biliup-cli",
     "crates/stream-gears",
+    "crates/danmaku",
 ]
 resolver = "3"
 
 [workspace.package]
-version = "1.1.29"
+version = "1.2.8"
 
 [workspace.dependencies]
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 serde_yaml = "0.9.34"
+toml = "0.8"
 bytes = "1.10.1"
 # FIXME: 等 rsa 0.10.0 发布后再更新
 rand = "0.8"
 serde_urlencoded = "0.7"
 
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "signal"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "signal", "sync"] }
 futures = "0.3.31"
 async-trait = "0.1.87"
 
@@ -34,7 +36,7 @@ chrono = { version = "0.4", features = ["serde"] }
 
 bon = "3.7.2"
 regex = "1.11.1"
-reqwest = { version = "0.12", default-features = false }
+reqwest = { version = "0.13.4", features = ["cookies", "form", "query"] }
 url = "2.5"
 
 

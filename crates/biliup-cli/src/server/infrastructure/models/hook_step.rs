@@ -1,11 +1,11 @@
 use crate::server::errors::{AppError, AppResult};
+use crate::tools;
 use error_stack::{ResultExt, bail};
 use serde::{Deserialize, Serialize};
-use std::borrow::Cow;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
 use tokio::fs;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::Command;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tracing::{error, info};
 
 /// 钩子步骤枚举：支持多种操作格式
@@ -17,6 +17,12 @@ pub enum HookStep {
     Run { run: String },
     /// 移动文件格式：{mv: "target_dir"}
     Move { mv: String },
+    /// ts→mp4 无重编码 remux 格式：{remux: "mp4"}
+    /// 解决 B 站对 .ts 直传时常见的 "时间戳跳变" 转码失败。
+    /// 用 ffmpeg `-c copy -fflags +genpts+igndts -bsf:a aac_adtstoasc -movflags +faststart`，
+    /// 重新生成 PTS。仅当输入扩展名为 .ts/.m2ts 时生效；其它格式跳过。
+    /// 路径列表会被原地替换为新生成的 .mp4，原文件保留（postprocessor 中再 "rm"）。
+    Remux { remux: String },
     /// 删除文件格式："rm"
     Remove(String),
 }
@@ -33,16 +39,26 @@ impl HookStep {
         match self {
             HookStep::Run { run } => {
                 // 执行自定义命令
-                let paths_str = video_paths
+                let paths: Vec<String> = video_paths
                     .iter()
-                    .map(|p| p.to_string_lossy())
-                    .reduce(|acc, e| Cow::from(acc.to_string() + "\n" + &*e))
-                    .ok_or(AppError::Unknown)?;
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .collect();
+                if paths.is_empty() {
+                    return Err(AppError::Unknown.into());
+                }
+                let paths_str = paths.join("\n");
                 self.execute_command(run, paths_str.as_bytes()).await?;
             }
             HookStep::Move { mv } => {
                 // 移动文件到指定目录
                 self.move_file(video_paths, mv).await?;
+            }
+            HookStep::Remux { remux } => {
+                bail!(AppError::Custom(format!(
+                    "remux step needs the path-mutating execute_paths API; \
+                     called via the legacy execute path with target={}",
+                    remux
+                )));
             }
             HookStep::Remove(cmd) if cmd == "rm" => {
                 // 删除文件
@@ -53,6 +69,112 @@ impl HookStep {
                 bail!(AppError::Custom(format!("Unknown command: {}", cmd)));
             }
         }
+        Ok(())
+    }
+
+    /// Path-mutating variant: lets steps swap entries in the working set
+    /// (e.g. Remux replaces .ts with the newly-created .mp4).
+    pub async fn execute_paths(&self, video_paths: &mut Vec<PathBuf>) -> AppResult<()> {
+        match self {
+            HookStep::Remux { remux } => {
+                let target = remux.to_lowercase();
+                if target != "mp4" {
+                    bail!(AppError::Custom(format!(
+                        "remux: only target=\"mp4\" supported, got {}",
+                        remux
+                    )));
+                }
+                for p in video_paths.iter_mut() {
+                    let ext = p
+                        .extension()
+                        .and_then(|s| s.to_str())
+                        .map(|s| s.to_lowercase())
+                        .unwrap_or_default();
+                    if ext != "ts" && ext != "m2ts" {
+                        info!("remux: skipping non-ts file {}", p.display());
+                        continue;
+                    }
+                    let mp4 = p.with_extension("mp4");
+                    if mp4.exists()
+                        && tokio::fs::metadata(&mp4)
+                            .await
+                            .map(|m| m.len() > 0)
+                            .unwrap_or(false)
+                    {
+                        info!("remux: reusing existing {}", mp4.display());
+                        *p = mp4;
+                        continue;
+                    }
+                    Self::ffmpeg_remux_to_mp4(p, &mp4).await?;
+                    *p = mp4;
+                }
+            }
+            other => {
+                // For non-path-mutating steps, fall back to the read-only API.
+                let refs: Vec<&Path> = video_paths.iter().map(|p| p.as_path()).collect();
+                other.execute(&refs).await?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn ffmpeg_remux_to_mp4(src: &Path, dst: &Path) -> AppResult<()> {
+        info!("remux ts→mp4: {} → {}", src.display(), dst.display());
+        let started = std::time::Instant::now();
+        let status = tools::ffmpeg_command()
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "warning",
+                "-y",
+                "-fflags",
+                "+genpts+igndts",
+                "-i",
+            ])
+            .arg(src)
+            .args([
+                "-c",
+                "copy",
+                "-bsf:a",
+                "aac_adtstoasc",
+                "-movflags",
+                "+faststart",
+                "-avoid_negative_ts",
+                "make_zero",
+            ])
+            .arg(dst)
+            .kill_on_drop(true)
+            .status()
+            .await
+            .change_context(AppError::Custom("failed to spawn ffmpeg".into()))?;
+        if !status.success() {
+            // Clean up partial output so a retry restarts cleanly.
+            let _ = tokio::fs::remove_file(dst).await;
+            bail!(AppError::Custom(format!(
+                "ffmpeg remux failed (status {:?}) for {}",
+                status,
+                src.display()
+            )));
+        }
+        let meta = tokio::fs::metadata(dst).await.change_context_lazy(|| {
+            AppError::Custom(format!("remux output missing: {}", dst.display()))
+        })?;
+        if meta.len() == 0 {
+            let _ = tokio::fs::remove_file(dst).await;
+            bail!(AppError::Custom(format!(
+                "ffmpeg produced empty mp4: {}",
+                dst.display()
+            )));
+        }
+        info!(
+            "remux done {} ({:.1} MiB) in {:.1}s",
+            dst.display(),
+            meta.len() as f64 / 1048576.0,
+            started.elapsed().as_secs_f64()
+        );
+        // Suppress unused-import warning for Duration on platforms that don't
+        // need it (kept for future timeout work).
+        let _ = Duration::from_secs(0);
         Ok(())
     }
 
@@ -92,7 +214,7 @@ impl HookStep {
         // 执行自定义命令
         // 解析命令和参数
         // 启动子进程，配置标准输入管道
-        let mut process = Command::new(shell)
+        let mut process = tools::command(shell)
             .arg(flag)
             .arg(cmd)
             .stdin(std::process::Stdio::piped())
@@ -109,39 +231,76 @@ impl HookStep {
                 .change_context(AppError::Unknown)?;
         }
 
-        let stdout = process.stdout.take().unwrap();
-        let stderr = process.stderr.take().unwrap();
+        let stdout = process
+            .stdout
+            .take()
+            .ok_or(AppError::Custom("Failed to capture stdout".to_string()))?;
+        let stderr = process
+            .stderr
+            .take()
+            .ok_or(AppError::Custom("Failed to capture stderr".to_string()))?;
 
-        let mut stdout_lines = BufReader::new(stdout).lines();
-        let mut stderr_lines = BufReader::new(stderr).lines();
+        // 子命令输出可能是 GBK、UTF-8 或任意字节流。这里不能按文本解码，
+        // 而是原样转发到控制台并追加到 Web 可查看的日志文件。
+        let stdout_task = tokio::spawn(Self::tee_command_output(
+            stdout,
+            tokio::io::stdout(),
+            "download.log",
+        ));
+        let stderr_task = tokio::spawn(Self::tee_command_output(
+            stderr,
+            tokio::io::stderr(),
+            "download.log",
+        ));
 
-        loop {
-            tokio::select! {
-                        line = stdout_lines.next_line() => {
-                            match line.change_context(AppError::Unknown)? {
-                                Some(l) => tracing::info!(target="user_cmd_stdout", "{}", l),
-                                None => break, // stdout EOF
-                            }
-                        }
-                        line = stderr_lines.next_line() => {
-                            match line.change_context(AppError::Unknown)? {
-                                Some(l) => tracing::warn!(target="user_cmd_stderr", "{}", l),
-                                None => break, // stderr EOF
-                            }
-                        }
-                    }
-        }
-
-        // 等待进程完成并检查退出状态
         let status = process.wait().await.change_context(AppError::Unknown)?;
+        stdout_task.await.change_context(AppError::Unknown)??;
+        stderr_task.await.change_context(AppError::Unknown)??;
 
         if !status.success() {
             bail!(AppError::Custom(format!(
-                        "Command failed with status: {}",
-                        status
-                    )));
+                "Command failed with status: {}",
+                status
+            )));
         }
 
+        Ok(())
+    }
+
+    async fn tee_command_output<R, W>(
+        mut reader: R,
+        mut terminal: W,
+        log_file: &'static str,
+    ) -> AppResult<()>
+    where
+        R: AsyncRead + Unpin,
+        W: AsyncWrite + Unpin,
+    {
+        let mut log = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(log_file)
+            .await
+            .change_context(AppError::Unknown)?;
+        let mut buf = [0; 8192];
+        loop {
+            let n = reader
+                .read(&mut buf)
+                .await
+                .change_context(AppError::Unknown)?;
+            if n == 0 {
+                break;
+            }
+            terminal
+                .write_all(&buf[..n])
+                .await
+                .change_context(AppError::Unknown)?;
+            log.write_all(&buf[..n])
+                .await
+                .change_context(AppError::Unknown)?;
+        }
+        terminal.flush().await.change_context(AppError::Unknown)?;
+        log.flush().await.change_context(AppError::Unknown)?;
         Ok(())
     }
 
@@ -161,13 +320,6 @@ impl HookStep {
 
         for video_path in video_paths {
             self.move_single_file(video_path, target_path).await?;
-
-            // 移动对应的 XML 文件
-            let xml_path = video_path.with_extension("xml");
-            if xml_path.exists() {
-                info!("移动弹幕文件: {}", xml_path.display());
-                self.move_single_file(&xml_path, target_path).await?;
-            }
         }
         Ok(())
     }
@@ -233,13 +385,6 @@ impl HookStep {
             fs::remove_file(video_path)
                 .await
                 .change_context(AppError::Unknown)?;
-            let buf = video_path.with_extension("xml");
-            if buf.exists() {
-                fs::remove_file(&buf)
-                    .await
-                    .change_context(AppError::Unknown)?;
-                info!("删除弹幕文件 - Removing: {}", buf.display());
-            }
         }
         Ok(())
     }
@@ -262,6 +407,129 @@ pub async fn process_video(video_path: &[&Path], processors: &[HookStep]) -> App
 
     info!("Video processing completed");
     Ok(())
+}
+
+/// Path-mutating processor pipeline. After each step the path list reflects any
+/// in-place transforms (e.g. Remux replaces .ts with .mp4). Callers can read the
+/// final paths to find the actual files to upload / postprocess.
+pub async fn process_video_paths(
+    video_paths: &mut Vec<PathBuf>,
+    processors: &[HookStep],
+) -> AppResult<()> {
+    info!("Starting video processing (path-mutating)...");
+    for processor in processors {
+        processor.execute_paths(video_paths).await?;
+    }
+    info!("Video processing completed");
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn deserialize_yaml_variants() {
+        let yaml = r#"
+- run: "echo hi"
+- mv: "/dst"
+- remux: "mp4"
+- "rm"
+"#;
+        let steps: Vec<HookStep> = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(steps.len(), 4);
+        assert!(matches!(steps[0], HookStep::Run { .. }));
+        assert!(matches!(steps[1], HookStep::Move { .. }));
+        assert!(matches!(steps[2], HookStep::Remux { .. }));
+        assert!(matches!(steps[3], HookStep::Remove(_)));
+    }
+
+    #[test]
+    fn deserialize_json_variants() {
+        let json = r#"[
+            {"run": "echo hi"},
+            {"mv": "/dst"},
+            {"remux": "mp4"},
+            "rm"
+        ]"#;
+        let steps: Vec<HookStep> = serde_json::from_str(json).unwrap();
+        assert_eq!(steps.len(), 4);
+        assert!(matches!(steps[2], HookStep::Remux { .. }));
+    }
+
+    #[tokio::test]
+    async fn remux_skips_non_ts() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("foo.mp4");
+        std::fs::write(&p, b"not a real mp4 but we shouldn't touch it").unwrap();
+        let mut paths = vec![p.clone()];
+        let step = HookStep::Remux {
+            remux: "mp4".into(),
+        };
+        step.execute_paths(&mut paths).await.unwrap();
+        // Already .mp4 → unchanged.
+        assert_eq!(paths[0], p);
+    }
+
+    #[tokio::test]
+    async fn move_uses_explicit_paths_without_inferred_xml() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        let dst = dir.path().join("dst");
+        std::fs::create_dir(&src).unwrap();
+        std::fs::create_dir(&dst).unwrap();
+        let video = src.join("segment.mp4");
+        let danmaku = src.join("segment.xml");
+        std::fs::write(&video, b"video").unwrap();
+        std::fs::write(&danmaku, b"danmaku").unwrap();
+        let paths = vec![video.as_path(), danmaku.as_path()];
+        let step = HookStep::Move {
+            mv: dst.display().to_string(),
+        };
+
+        step.execute(&paths).await.unwrap();
+
+        assert!(!video.exists());
+        assert!(!danmaku.exists());
+        assert_eq!(std::fs::read(dst.join("segment.mp4")).unwrap(), b"video");
+        assert_eq!(std::fs::read(dst.join("segment.xml")).unwrap(), b"danmaku");
+    }
+
+    #[tokio::test]
+    async fn remove_uses_explicit_paths_without_inferred_xml() {
+        let dir = tempfile::tempdir().unwrap();
+        let video = dir.path().join("segment.mp4");
+        let danmaku = dir.path().join("segment.xml");
+        std::fs::write(&video, b"video").unwrap();
+        std::fs::write(&danmaku, b"danmaku").unwrap();
+        let paths = vec![video.as_path(), danmaku.as_path()];
+        let step = HookStep::Remove("rm".into());
+
+        step.execute(&paths).await.unwrap();
+
+        assert!(!video.exists());
+        assert!(!danmaku.exists());
+    }
+
+    /// 复现 pipeline_upload_videos 的 fault-tolerance 触发条件：
+    /// segment_processor 在 ffmpeg 退非 0 时返回 Err。生产事故就是这一步因磁盘满
+    /// 而失败，调用方必须能从 Err 恢复（log + continue 而不是 ? 早退）。
+    #[tokio::test]
+    async fn remux_fails_when_ffmpeg_cannot_read_input() {
+        let dir = tempfile::tempdir().unwrap();
+        let bogus = dir.path().join("does_not_exist.ts");
+        let mut paths = vec![bogus.clone()];
+        let step = HookStep::Remux {
+            remux: "mp4".into(),
+        };
+        let result = step.execute_paths(&mut paths).await;
+        assert!(
+            result.is_err(),
+            "ffmpeg 读不到输入应返回 Err，调用方才能在 pipeline 里做 log+continue"
+        );
+        // 失败时不要把破损的 mp4 留在磁盘上（idempotent retry 前提）
+        assert!(!bogus.with_extension("mp4").exists());
+    }
 }
 
 pub async fn process(input: &[u8], processors: &Option<Vec<HookStep>>) {

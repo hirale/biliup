@@ -3,6 +3,7 @@ use biliup::uploader::util::SubmitOption;
 use clap::{Parser, Subcommand};
 
 use crate::UploadLine;
+use crate::season_cli::SeasonArgs;
 use std::path::PathBuf;
 
 /// 扩展路径中的 ~ 为用户主目录
@@ -31,9 +32,9 @@ pub struct Cli {
     #[arg(short, long, default_value = "cookies.json")]
     pub user_cookie: PathBuf,
 
-    // #[arg(long, default_value = "sqlx=debug,tower_http=debug,info")]
-    #[arg(long, default_value = "tower_http=debug,info")]
-    pub rust_log: String,
+    /// 日志过滤规则，如 debug；不指定时读取环境变量 RUST_LOG，都没有则为 tower_http=debug,info
+    #[arg(long)]
+    pub rust_log: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -103,6 +104,38 @@ pub enum Commands {
         // #[clap()]
         vid: Vid,
     },
+    /// 查看视频评论
+    Comments {
+        /// vid为稿件 av 或 bv 号
+        vid: Vid,
+
+        /// 排序方式，0为按时间，2为按热度
+        #[arg(long, default_value = "0")]
+        sort: u8,
+
+        /// 页码
+        #[arg(long, default_value = "1")]
+        pn: u32,
+
+        /// 每页条数
+        #[arg(long, default_value = "20")]
+        ps: u32,
+    },
+    /// 回复视频评论，默认只打印将要回复的内容
+    Reply {
+        /// vid为稿件 av 或 bv 号
+        vid: Vid,
+
+        /// 评论 rpid
+        rpid: u64,
+
+        /// 回复内容
+        message: String,
+
+        /// 实际发送回复
+        #[arg(long)]
+        execute: bool,
+    },
     /// 输出flv元数据
     DumpFlv {
         #[arg()]
@@ -127,7 +160,7 @@ pub enum Commands {
     /// 启动web服务，默认端口19159
     Server {
         /// Specify bind address
-        #[arg(short, long, default_value = "0.0.0.0")]
+        #[arg(short, long, default_value = "127.0.0.1")]
         bind: String,
 
         /// Port to use
@@ -137,6 +170,22 @@ pub enum Commands {
         /// 开启登录密码认证
         #[arg(long, default_value = "false")]
         auth: bool,
+
+        /// 为会话 Cookie 附加 Secure 属性。仅当通过 HTTPS 反向代理访问 Web UI 时开启；
+        /// 直接通过 HTTP 远程访问时开启会导致浏览器丢弃登录态
+        #[arg(long, default_value = "false")]
+        secure_session_cookie: bool,
+
+        /// 使用 biliup 1.0.7 风格配置文件启动录制
+        #[arg(short, long, value_name = "FILE")]
+        config: Option<PathBuf>,
+    },
+    /// 管理自己的合集：列合集、查小节、加入 / 移出稿件、排序
+    Season(SeasonArgs),
+    /// 管理 Web 界面的登录用户（在 biliup 服务的工作目录下执行，直接读写 data/data.sqlite3）
+    User {
+        #[command(subcommand)]
+        action: UserAction,
     },
     /// 列出所有已上传的视频
     List {
@@ -162,6 +211,17 @@ pub enum Commands {
     },
 }
 
+#[derive(Subcommand)]
+pub enum UserAction {
+    /// 列出所有 Web 用户
+    List,
+    /// 重置某个 Web 用户的密码并让其所有会话失效；新密码从终端提示输入，或从标准输入读一行
+    ResetPassword {
+        /// 用户名（大小写不敏感）
+        username: String,
+    },
+}
+
 fn human_size(s: &str) -> Result<u64, String> {
     let ret = match s.as_bytes() {
         [init @ .., b'K'] => parse_u8(init)? * 1000.0,
@@ -177,4 +237,58 @@ fn parse_u8(string: &[u8]) -> Result<f64, String> {
     string
         .parse()
         .map_err(|e| format!("{string} is not ascii digit. {:?}", e))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Cli, Commands};
+    use clap::Parser;
+    use std::path::Path;
+
+    #[test]
+    fn server_defaults_to_loopback_and_default_cookie_file() {
+        let cli = Cli::try_parse_from(["biliup", "server"]).unwrap();
+
+        assert_eq!(cli.user_cookie, Path::new("cookies.json"));
+        assert!(matches!(
+            cli.command,
+            Commands::Server {
+                ref bind,
+                auth: false,
+                secure_session_cookie: false,
+                ..
+            } if bind == "127.0.0.1"
+        ));
+    }
+
+    #[test]
+    fn user_subcommands_parse() {
+        let cli = Cli::try_parse_from(["biliup", "user", "reset-password", "biliup"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::User {
+                action: super::UserAction::ResetPassword { ref username }
+            } if username == "biliup"
+        ));
+        let cli = Cli::try_parse_from(["biliup", "user", "list"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::User {
+                action: super::UserAction::List
+            }
+        ));
+    }
+
+    #[test]
+    fn server_preserves_an_explicit_cookie_file() {
+        let cli = Cli::try_parse_from([
+            "biliup",
+            "--user-cookie",
+            "/tmp/private-account.json",
+            "server",
+        ])
+        .unwrap();
+
+        assert_eq!(cli.user_cookie, Path::new("/tmp/private-account.json"));
+    }
 }

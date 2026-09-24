@@ -12,6 +12,7 @@ import { useState } from 'react'
 import { LiveStreamerEntity } from '../lib/api-streamer'
 import { SupportedPlatforms } from '@/app/ui/plugins'
 import { useBiliUsers } from '../lib/use-streamers'
+import { FileSizeField } from './FileSizeInput'
 
 type PluginProps = {
   entity?: LiveStreamerEntity
@@ -47,6 +48,12 @@ const removeCircularReferences = (obj: any, seen = new WeakSet()): any => {
   return result
 }
 
+type PlatformPattern = keyof typeof SupportedPlatforms
+
+/** 按直播间地址找到对应平台插件在 SupportedPlatforms 里的键;没匹配到返回 undefined */
+const matchPlatformPattern = (url?: string): PlatformPattern | undefined =>
+  (Object.keys(SupportedPlatforms) as PlatformPattern[]).find(pattern => url?.match(new RegExp(pattern)))
+
 const OverrideModal: React.FC<TemplateModalProps> = ({ children, entity, onOk }) => {
   const [isOpen, setOpen] = useState(false)
 
@@ -54,18 +61,13 @@ const OverrideModal: React.FC<TemplateModalProps> = ({ children, entity, onOk })
     setOpen(!isOpen)
   }
 
-  const platformSetting = () => {
-    for (const [pattern, Plugin] of Object.entries(SupportedPlatforms)) {
-      if (entity?.url.match(new RegExp(pattern))) {
-        // console.log('匹配到平台:', pattern)
-        return Plugin as React.ComponentType<PluginProps>
-      }
-    }
-    // console.log('未匹配到平台')
-    return null
-  }
+  // 平台插件组件从模块级常量表里按键取出,渲染间始终是同一个引用,不会因为重渲染而重置内部状态
+  const platformPattern = matchPlatformPattern(entity?.url)
+  const PlatformPlugin = platformPattern
+    ? (SupportedPlatforms[platformPattern] as React.ComponentType<PluginProps>)
+    : null
 
-  const api = useRef<FormApi>()
+  const api = useRef<FormApi>(undefined)
 
   const { biliUsers } = useBiliUsers()
   const list = biliUsers?.map(item => {
@@ -92,9 +94,11 @@ const OverrideModal: React.FC<TemplateModalProps> = ({ children, entity, onOk })
       'url',
       'remark',
       'filename',
+      'filename_prefix',
       'split_time',
       'split_size',
       'upload_id',
+      'upload_streamers_id',
       'status',
       'format',
       'time_range',
@@ -124,18 +128,27 @@ const OverrideModal: React.FC<TemplateModalProps> = ({ children, entity, onOk })
 
       const overrideConfig = { ...(values.override || {}) }
       Object.keys(values).forEach(key => {
-        console.log(key, values[key])
         if (!entityFields.has(key)) {
-          if (values[key] != undefined && values[key] != null) {
-            overrideConfig[key] = values[key]
+          if (values[key] !== undefined) {
+            overrideConfig[key] = values[key] === '' ? null : values[key]
           }
           delete values[key]
         }
       })
       values.override = overrideConfig
 
+      // PUT /v1/streamers 会按整行覆盖。漏掉 upload_streamers_id 会被写成 NULL，
+      // 之后录像走默认 rm 且不再投稿。以当前行打底，再叠表单字段。
+      const payload = {
+        ...entity,
+        ...values,
+        override: overrideConfig,
+        upload_streamers_id:
+          values.upload_streamers_id ?? entity?.upload_streamers_id ?? null,
+      }
+
       // 处理循环引用
-      const cleanValues = removeCircularReferences(values)
+      const cleanValues = removeCircularReferences(payload)
       await onOk(cleanValues)
       setVisible(false)
       return
@@ -147,7 +160,7 @@ const OverrideModal: React.FC<TemplateModalProps> = ({ children, entity, onOk })
   }
 
   const childrenWithProps = React.Children.map(children, child => {
-    if (React.isValidElement<any>(child)) {
+    if (React.isValidElement<{ onClick?: () => void }>(child)) {
       return React.cloneElement(child, {
         onClick: () => {
           showDialog()
@@ -169,7 +182,7 @@ const OverrideModal: React.FC<TemplateModalProps> = ({ children, entity, onOk })
       <Form.Select
         label="下载插件（downloader）"
         field="downloader"
-        placeholder="stream-gears（默认）"
+        placeholder="mesio（默认）"
         style={{ width: '100%' }}
         fieldStyle={{
           alignSelf: 'stretch',
@@ -179,16 +192,15 @@ const OverrideModal: React.FC<TemplateModalProps> = ({ children, entity, onOk })
       >
         <Select.Option value="streamlink">streamlink（hls多线程下载）</Select.Option>
         <Select.Option value="ffmpeg">ffmpeg</Select.Option>
-        <Select.Option value="stream-gears">stream-gears（默认）</Select.Option>
+        <Select.Option value="stream-gears">stream-gears</Select.Option>
         <Select.Option value="sync-downloader">sync-downloader（边录边传）</Select.Option>
+        <Select.Option value="mesio">mesio（默认）</Select.Option>
       </Form.Select>
 
-      <Form.InputNumber
+      <FileSizeField
         label="视频分段大小（file_size）"
         field="file_size"
-        placeholder=""
-        suffix={'Byte'}
-        style={{ width: '100%' }}
+        extraText="按 1024 进制：1 GB = 1024 MB。没填过的留空即跟随全局设置；把已有的值清空，则这个主播不按大小分段（边录边传仍约 2 GB 一段）。"
         fieldStyle={{
           alignSelf: 'stretch',
           padding: 0,
@@ -215,7 +227,7 @@ const OverrideModal: React.FC<TemplateModalProps> = ({ children, entity, onOk })
             message: '只接受数字和英文冒号',
           },
           {
-            pattern: /^[0-9]{2,4}:[0-5][0-9]:[0-5][0-9]$/,
+            pattern: /^$|^[0-9]{2,4}:[0-5][0-9]:[0-5][0-9]$/,
             message: '分或秒不符合规范',
           },
         ]}
@@ -278,12 +290,9 @@ const OverrideModal: React.FC<TemplateModalProps> = ({ children, entity, onOk })
           <Form.Section>
             <Collapse defaultActiveKey={['plugin']}>
               {downloadSettings}
-              {(() => {
-                const Plugin = platformSetting()
-                return Plugin ? (
-                  <Plugin entity={entity} list={list} initValues={entity?.override} />
-                ) : null
-              })()}
+              {PlatformPlugin ? (
+                <PlatformPlugin entity={entity} list={list} initValues={entity?.override} />
+              ) : null}
             </Collapse>
           </Form.Section>
         </Form>

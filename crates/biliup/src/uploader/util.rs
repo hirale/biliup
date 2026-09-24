@@ -25,3 +25,26 @@ impl FromStr for SubmitOption {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::SubmitOption;
+    use std::str::FromStr;
+
+    #[test]
+    fn parse_submit_options() {
+        assert!(matches!(
+            SubmitOption::from_str("app").unwrap(),
+            SubmitOption::App
+        ));
+        assert!(matches!(
+            SubmitOption::from_str("web").unwrap(),
+            SubmitOption::Web
+        ));
+        assert!(matches!(
+            SubmitOption::from_str("bcut_android").unwrap(),
+            SubmitOption::BCutAndroid
+        ));
+        assert!(SubmitOption::from_str("unknown").is_err());
+    }
+}

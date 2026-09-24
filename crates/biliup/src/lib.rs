@@ -7,6 +7,7 @@ use tracing::info;
 pub mod client;
 pub mod downloader;
 pub mod error;
+pub mod tools;
 pub mod uploader;
 
 pub use uploader::bilibili;
@@ -39,9 +40,10 @@ where
             Err(e) if retries > 0 => {
                 // 如果提供了 should_retry 条件，检查是否应该重试
                 if let Some(ref predicate) = should_retry
-                    && !predicate(&e) {
-                        break Err(e);
-                    }
+                    && !predicate(&e)
+                {
+                    break Err(e);
+                }
 
                 retries -= 1;
                 let jitter_factor =

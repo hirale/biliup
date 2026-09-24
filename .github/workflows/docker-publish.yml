@@ -15,7 +15,6 @@ on:
 
 permissions:
   contents: read
-  packages: write
 
 env:
   IMAGE_NAME: ghcr.io/hirale/biliup
@@ -28,6 +27,9 @@ jobs:
     name: Build for ${{ matrix.platform }}
     runs-on: ${{ matrix.runner }}
     if: github.event_name == 'push'
+    permissions:
+      contents: read
+      packages: write
     strategy:
       matrix:
         include:
@@ -103,6 +105,8 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     if: github.event_name == 'push'
+    permissions:
+      packages: write
 
     steps:
       - name: Download digests

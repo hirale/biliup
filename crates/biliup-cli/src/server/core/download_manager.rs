@@ -1,11 +1,11 @@
-use crate::server::common::download::{DActor, DownloaderMessage};
 use crate::server::common::upload::UActor;
 use crate::server::core::monitor::Monitor;
-use crate::server::core::plugin::DownloadPlugin;
 use crate::server::infrastructure::connection_pool::ConnectionPool;
 use crate::server::infrastructure::context::{Stage, Worker, WorkerStatus};
-use async_channel::{Sender, bounded};
+use async_channel::bounded;
+use biliup::downloader::live::LivePlugin;
 use std::sync::Arc;
+use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 use tracing::info;
 
@@ -13,17 +13,11 @@ use tracing::info;
 /// 负责管理特定平台的下载任务，包括监控器和插件
 pub struct DownloadManager {
     /// 下载插件
-    // plugins: Vec<Arc<dyn DownloadPlugin + Send + Sync>>,
+    // plugins: Vec<Arc<dyn LivePlugin + Send + Sync>>,
     rooms_handle: Arc<Monitor>,
 
-    /// 下载信号量数量
-    download_semaphore: u32,
-    /// 上传信号量数量
-    update_semaphore: u32,
-    /// 下载消息发送器
-    pub down_sender: Sender<DownloaderMessage>,
-    /// 下载Actor任务句柄列表
-    pub(crate) d_kills: Vec<JoinHandle<()>>,
+    /// 下载池大小。真正的并发控制由 Monitor 持有的 Semaphore 完成。
+    pub download_semaphore: u32,
     /// 上传Actor任务句柄列表
     pub(crate) u_kills: Vec<JoinHandle<()>>,
 }
@@ -37,17 +31,13 @@ impl DownloadManager {
     pub fn new(download_semaphore: u32, update_semaphore: u32, pool: ConnectionPool) -> Self {
         // 创建消息通道
         let (up_tx, up_rx) = bounded(16);
-        let (down_tx, down_rx) = bounded(1);
-        let mut d_kills = Vec::new();
         let mut u_kills = Vec::new();
 
-        let rooms_handle = Arc::new(Monitor::new(down_tx.clone(), pool.clone()));
-        // 创建下载Actor
-        for _ in 0..download_semaphore {
-            let mut d_actor = DActor::new(down_rx.clone(), up_tx.clone(), rooms_handle.clone());
-            let d_kill = tokio::spawn(async move { d_actor.run().await });
-            d_kills.push(d_kill)
-        }
+        let rooms_handle = Arc::new(Monitor::new(
+            up_tx.clone(),
+            Arc::new(Semaphore::new(download_semaphore as usize)),
+            pool.clone(),
+        ));
         // 创建上传Actor
         for _ in 0..update_semaphore {
             let mut u_actor = UActor::new(up_rx.clone());
@@ -57,21 +47,15 @@ impl DownloadManager {
 
         Self {
             download_semaphore,
-            update_semaphore,
-            down_sender: down_tx,
-            d_kills,
             u_kills,
             rooms_handle,
         }
     }
 
-    pub fn add_plugin(&self, plugin: Arc<dyn DownloadPlugin + Send + Sync>) {
-        let rooms_handle = self.rooms_handle.clone();
-        tokio::spawn(async move {
-            let name = plugin.name().to_string();
-            rooms_handle.add_plugin(plugin).await;
-            info!("Added plugin[{}]", name);
-        });
+    pub async fn add_plugin(&self, plugin: Arc<dyn LivePlugin + Send + Sync>) {
+        let name = plugin.name().to_string();
+        self.rooms_handle.add_plugin(plugin).await;
+        info!("Added plugin[{}]", name);
     }
 
     pub async fn add_room(&self, worker: Worker) -> Option<()> {
@@ -106,6 +90,11 @@ impl DownloadManager {
             .cloned()
     }
 
+    /// 按房间 URL 找到对应的平台插件。
+    pub async fn plugin_for(&self, url: &str) -> Option<Arc<dyn LivePlugin + Send + Sync>> {
+        self.rooms_handle.plugin_for(url).await
+    }
+
     pub async fn cleanup(&self) {
         let vec = self.rooms_handle.get_all().await;
         for worker in vec {
@@ -119,11 +108,6 @@ impl DownloadManager {
 
 impl Drop for DownloadManager {
     fn drop(&mut self) {
-        // 发送端随 ActorHandle 一起被 drop，会关闭通道（如果没有其他 sender 克隆）。
-        // 为避免 tokio 任务在后台“挂着”，这里直接 abort。
-        // for h in &self.d_kills {
-        //     h.abort();
-        // }
         for h in &self.u_kills {
             h.abort();
         }

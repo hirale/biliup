@@ -1,10 +1,11 @@
 ######### 全局录播与上传设置 #########
 #------录制与下载------#
-### 选择全局默认的下载插件，默认为stream-gears。可选：
+### 选择全局默认的下载插件，默认为mesio。可选：
 ### 1.streamlink(streamlink配合ffmpeg混合下载模式，适合用于下载hls_fmp4与hls_ts流，因为streamlink支持多线程拉取）。
 ### 使用该模式下载flv流时，将会仅使用ffmpeg。请手动安装streamlink以及ffmpeg。
 ### 2.ffmpeg（纯ffmpeg下载），请手动安装ffmpeg。
-### 3.stream-gears
+### 3.stream-gears（不支持 HEVC 与 hls_fmp4，FLV 时间戳沿用源站原值）
+### 4.mesio（默认。内置 rust-srec 引擎，进程内下载 FLV/HLS 并修复时间戳、注入关键帧索引，支持按大小/时长分段，无需额外安装）
 #downloader = "ffmpeg"
 ### 录像单文件大小限制，单位Byte，超过此大小分段下载，下载回放时无法使用
 file_size = 2621440000
@@ -24,7 +25,7 @@ filtering_threshold = 20
 #submit_api = "client"
 ### 选择全局默认上传插件，Noop为不上传，但会执行后处理,可选bili_web，biliup-rs(默认值)
 #uploader = "Noop"
-### b站上传线路选择，默认自动选择最优线路。目前可手动切换为alia（海外）, bda2（大陆）, bldsa（大陆）, qn（全球）, tx（大陆）, txa（海外）
+### b站上传线路选择，默认自动选择最优线路。目前可手动切换为alia（海外）, bda2（大陆）, bldsa（大陆）, tx（大陆）, txa（海外）, estx（大陆）, akbd（大陆）
 lines = "AUTO"
 ### 单文件并发上传数,未达到带宽上限时,增大此值可提高上传速度(不要设置过大,部分线路限制为8,如速度不佳优先调整上传线路)
 threads = 3
@@ -207,7 +208,7 @@ description = """
 视频简介: {title} %Y-%m-%d %H:%M:%S
 {streamer}主播直播间地址：{url}
 ---
-Powered By biliup - Github: https://github.com/ForgQi/biliup"""
+Powered By biliup - Github: https://github.com/biliup/biliup"""
 ### 如需在简介中@别人 请使用以下模版
 #credits = [
 #  { username = "需要@的用户名", uid = 需要@的uid }
@@ -217,7 +218,7 @@ Powered By biliup - Github: https://github.com/ForgQi/biliup"""
 #{streamer}主播直播间地址：{url}
 #【@credit】
 #---
-#Powered By biliup - Github: https://github.com/ForgQi/biliup
+#Powered By biliup - Github: https://github.com/biliup/biliup
 #"""
 dynamic = "#空间动态#"
 #dtime = 14_400 ### 设置延时发布时间，距离提交大于2小时，格式为时间戳

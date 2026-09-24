@@ -60,9 +60,9 @@ $ biliup --config ./config.yaml start
 ```
 从 v0.2.15 版本开始，配置文件支持 toml 格式，详见 [config.toml](https://github.com/biliup/biliup/tree/master/public/config.toml) ，
 yaml配置文件完整内容可参照 [config.yaml](https://github.com/biliup/biliup/tree/master/public/config.yaml) 。
-__FFmpeg__ 作为可选依赖。如果还有问题可以 [加群讨论](https://github.com/ForgQi/biliup/discussions/58#discussioncomment-2388776) 。
+__FFmpeg__ 作为可选依赖。如果还有问题可以 [加群讨论](https://github.com/biliup/biliup/discussions/58#discussioncomment-2388776) 。
 
-> 使用上传功能需要登录B站，通过 [命令行投稿工具](https://github.com/ForgQi/biliup-rs) 获取 cookies.json，并放入启动 biliup 的路径即可
+> 使用上传功能需要登录B站，通过 [命令行投稿工具](https://github.com/biliup/biliup-rs) 获取 cookies.json，并放入启动 biliup 的路径即可
 
 > ARM平台用户，需要使用到stream-gears（默认下载器与上传器）进行下载和上传的，请参考此教程降级stream-gears版本。 https://github.com/biliup/biliup/discussions/407
 
@@ -113,20 +113,20 @@ sudo docker exec -it imageId /bin/bash
 
 ## 从源码运行biliup
 * 下载源码: `git clone https://github.com/ForgQi/bilibiliupload.git`
-* 安装: `pip3 install -e .`
+* 安装: `pip3 install -e ./crates/stream-gears`
 * 启动: `python3 -m biliup`
 * 构建:
   ```shell
   $ npm install
   $ npm run build
-  $ python3 -m build
+  $ python3 -m build crates/stream-gears
   ```
 * 调试 webUI: `python3 -m biliup --static-dir public`
 
 
 ## yaml配置文件示例
 可选项见[完整配置文件](https://github.com/biliup/biliup/tree/master/public/config.yaml),
-tid投稿分区见[Wiki](https://github.com/ForgQi/biliup/wiki)
+tid投稿分区见[Wiki](https://github.com/biliup/biliup/wiki)；可选 `tid_v2` 指定新版分区 ID（与旧版 `tid` 可同时设置）
 ```yaml
 streamers:
     xxx直播录像:
@@ -148,6 +148,7 @@ video.desc = '视频简介'
 video.source = '添加转载地址说明'
 # 设置视频分区,默认为122 野生技能协会
 video.tid = 171
+# video.tid_v2 = 2102  # 可选：新版分区 ID
 video.set_tag(['星际争霸2', '电子竞技'])
 video.dynamic = '动态内容'
 lines = 'AUTO'

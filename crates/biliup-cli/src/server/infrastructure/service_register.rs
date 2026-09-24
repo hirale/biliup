@@ -1,13 +1,14 @@
 use crate::LogHandle;
+use crate::server::api::live_media::ImageProxy;
 use crate::server::config::Config;
 use crate::server::core::download_manager::DownloadManager;
-use crate::server::core::plugin::yy::YY;
 use crate::server::infrastructure::connection_pool::ConnectionPool;
 use crate::server::infrastructure::context::Worker;
 use crate::server::infrastructure::models::live_streamer::LiveStreamer;
 use crate::server::infrastructure::models::upload_streamer::UploadStreamer;
 use axum::extract::FromRef;
 use biliup::client::StatelessClient;
+use biliup::downloader::live::builtin_plugins;
 use error_stack::Report;
 use error_stack::fmt::ColorMode;
 use std::sync::{Arc, RwLock};
@@ -27,6 +28,9 @@ pub struct ServiceRegister {
     pub client: StatelessClient,
 
     pub log_handle: LogHandle,
+
+    /// 录制中直播间封面 / 头像的图片代理（抓取客户端 + 内存缓存）
+    pub image_proxy: Arc<ImageProxy>,
 }
 
 /// 简单的服务容器，负责管理API端点通过axum扩展获取的各种服务
@@ -38,7 +42,7 @@ impl ServiceRegister {
     /// * `config` - 全局配置
     /// * `actor_handle` - Actor处理器
     /// * `download_manager` - 下载管理器列表
-    pub fn new(
+    pub async fn new(
         pool: ConnectionPool,
         config: Arc<RwLock<Config>>,
         download_manager: DownloadManager,
@@ -52,7 +56,9 @@ impl ServiceRegister {
         info!("utility services initialized, building feature services...");
 
         // download_manager.push(DownloadManager::new(YY::new(), actor_handle.clone()));
-        download_manager.add_plugin(Arc::new(YY::new()));
+        for plugin in builtin_plugins() {
+            download_manager.add_plugin(plugin).await;
+        }
 
         info!("feature services successfully initialized!");
         ServiceRegister {
@@ -61,6 +67,7 @@ impl ServiceRegister {
             config: config.clone(),
             client,
             log_handle,
+            image_proxy: Arc::new(ImageProxy::new()),
         }
     }
 

@@ -1,14 +1,15 @@
 use crate::server::common::download::DownloadTask;
+use crate::server::common::recording_policy::Rejection;
 use crate::server::common::util::Recorder;
-use crate::server::config::{Config, default_segment_time};
+use crate::server::config::Config;
 use crate::server::core::downloader::DownloadConfig;
-use crate::server::core::plugin::StreamInfoExt;
+use crate::server::core::live::streamer_info;
 use crate::server::infrastructure::connection_pool::ConnectionPool;
 use crate::server::infrastructure::models::StreamerInfo;
 use crate::server::infrastructure::models::live_streamer::LiveStreamer;
 use crate::server::infrastructure::models::upload_streamer::UploadStreamer;
-use axum::http::Extensions;
 use biliup::client::StatelessClient;
+use biliup::downloader::live::LiveStream;
 use core::fmt;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
@@ -21,9 +22,8 @@ pub struct Context {
     id: i64,
     /// 工作器实例
     worker: Arc<Worker>,
-    stream_info: StreamInfoExt,
-    /// 扩展数据容器
-    extension: Extensions,
+    stream: LiveStream,
+    streamer_info: StreamerInfo,
     pool: ConnectionPool,
 }
 
@@ -32,18 +32,14 @@ impl Context {
     ///
     /// # 参数
     /// * `worker` - 工作器实例的Arc引用
-    pub fn new(
-        id: i64,
-        worker: Arc<Worker>,
-        pool: ConnectionPool,
-        stream_info: StreamInfoExt,
-        extension: Extensions,
-    ) -> Self {
+    pub fn new(id: i64, worker: Arc<Worker>, pool: ConnectionPool, stream: LiveStream) -> Self {
+        let mut streamer_info = streamer_info(&stream);
+        streamer_info.id = id;
         Self {
             id,
             worker,
-            stream_info,
-            extension,
+            stream,
+            streamer_info,
             pool,
         }
     }
@@ -54,6 +50,10 @@ impl Context {
 
     pub fn id(&self) -> i64 {
         self.id
+    }
+
+    pub(crate) fn worker(&self) -> &Arc<Worker> {
+        &self.worker
     }
 
     pub fn live_streamer(&self) -> &LiveStreamer {
@@ -98,28 +98,39 @@ impl Context {
         )
     }
 
-    pub fn stream_info_ext(&self) -> &StreamInfoExt {
-        &self.stream_info
+    pub fn live_stream(&self) -> &LiveStream {
+        &self.stream
     }
 
-    pub fn download_config(&self, ext: &StreamInfoExt) -> DownloadConfig {
+    pub fn streamer_info(&self) -> &StreamerInfo {
+        &self.streamer_info
+    }
+
+    pub fn download_config(&self, stream: &LiveStream) -> DownloadConfig {
         let config = self.config();
         // 确定文件格式后缀
         let suffix = self
             .live_streamer()
             .format
             .clone()
-            .unwrap_or_else(|| ext.suffix.to_string());
+            .unwrap_or_else(|| stream.suffix.to_string());
+        let mut stream_info = streamer_info(stream);
+        if stream.url == self.stream.url {
+            stream_info.id = self.streamer_info.id;
+        }
         DownloadConfig {
             // 流URL
-            url: ext.raw_stream_url.to_string(),
-            segment_time: config.segment_time.or_else(default_segment_time),
-            file_size: Some(config.file_size), // 2GB
-            headers: ext.stream_headers.clone(),
-            recorder: self.recorder(ext.streamer_info.clone()),
+            url: stream.raw_stream_url.to_string(),
+            segment_time: config.segment_time,
+            time_range: self.live_streamer().time_range.clone(),
+            file_size: config.file_size,
+            headers: stream.stream_headers.clone(),
+            recorder: self.recorder(stream_info),
             // output_dir: PathBuf::from("./downloads")
             output_dir: PathBuf::from("."),
             suffix,
+            bytes_written: Default::default(),
+            preview: Default::default(),
         }
     }
 }
@@ -139,6 +150,11 @@ pub struct Worker {
     config: Arc<RwLock<Config>>,
     /// HTTP客户端
     pub client: StatelessClient,
+    /// 最近一次开播探测被录制策略挡下的原因，仅用于向界面解释「为什么没在录」。
+    ///
+    /// 不参与任何控制流。只存需要流信息才能判定的结论（如标题命中排除关键词）；
+    /// 探测前就能判定的条件（如录制时间范围）由接口侧按当前时钟实时算，不会过期。
+    last_rejection: RwLock<Option<Rejection>>,
 }
 
 impl Worker {
@@ -162,16 +178,22 @@ impl Worker {
             upload_streamer,
             config,
             client,
+            last_rejection: RwLock::new(None),
         }
-    }
-
-    /// 判断是否应该录制
-    fn should_record(&self, room_title: &str) -> bool {
-        true
     }
 
     pub fn id(&self) -> i64 {
         self.live_streamer.id
+    }
+
+    /// 记录本轮开播探测的策略判定结果（`None` 表示未被挡下）。
+    pub fn set_rejection(&self, rejection: Option<Rejection>) {
+        *self.last_rejection.write().unwrap() = rejection;
+    }
+
+    /// 最近一次探测被挡下的原因。
+    pub fn rejection(&self) -> Option<Rejection> {
+        self.last_rejection.read().unwrap().clone()
     }
 
     /// 获取主播信息
@@ -285,51 +307,61 @@ impl fmt::Debug for WorkerStatus {
     }
 }
 
-/// 应用程序上下文，包含工作器和扩展信息
-#[derive(Debug, Clone)]
-pub struct PluginContext {
-    /// 工作器实例
-    worker: Arc<Worker>,
-    pool: ConnectionPool,
-    extension: Extensions,
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::server::config::ConfigPatch;
+    use crate::server::core::downloader::DownloaderType;
+    use crate::server::core::downloader::sync_downloader::align_file_size;
 
-impl PluginContext {
-    pub fn new(worker: Arc<Worker>, pool: ConnectionPool) -> Self {
-        Self {
-            worker,
-            pool,
-            extension: Default::default(),
+    fn streamer_with_override(override_cfg: Option<ConfigPatch>) -> LiveStreamer {
+        LiveStreamer {
+            id: 1,
+            url: "https://live.bilibili.com/1".into(),
+            remark: "test".into(),
+            filename_prefix: None,
+            time_range: None,
+            upload_streamers_id: None,
+            format: None,
+            override_cfg,
+            preprocessor: None,
+            segment_processor: None,
+            downloaded_processor: None,
+            postprocessor: None,
+            opt_args: None,
+            excluded_keywords: None,
         }
     }
 
-    pub fn to_context(&self, id: i64, stream_info: StreamInfoExt) -> Context {
-        Context::new(
-            id,
-            self.worker.clone(),
-            self.pool.clone(),
-            stream_info,
-            self.extension.clone(),
-        )
-    }
+    /// 复现：全局 file_size=100MB，主播覆写只选了 sync-downloader，
+    /// 覆写经落库回传后 worker 取到的配置必须仍是 100MB，边录边传按 100MiB 切段。
+    #[test]
+    fn worker_config_keeps_global_file_size_when_override_never_set_it() {
+        let global_size = 104_857_600u64;
+        let config = Arc::new(RwLock::new(Config {
+            file_size: Some(global_size),
+            ..Config::default()
+        }));
+        // 与 WebUI 保存后的路径一致：反序列化 -> 落库序列化 -> 再反序列化
+        let submitted: ConfigPatch =
+            serde_json::from_str(r#"{"downloader":"sync-downloader"}"#).unwrap();
+        let stored = serde_json::to_string(&submitted).unwrap();
+        let loaded: ConfigPatch = serde_json::from_str(&stored).unwrap();
 
-    pub fn config(&self) -> Config {
-        self.worker.get_config()
-    }
+        let worker = Worker::new(
+            streamer_with_override(Some(loaded)),
+            None,
+            config,
+            StatelessClient::default(),
+        );
+        let effective = worker.get_config();
 
-    pub fn live_streamer(&self) -> &LiveStreamer {
-        &self.worker.get_streamer()
-    }
-
-    pub fn upload_config(&self) -> &Option<UploadStreamer> {
-        self.worker.get_upload_config()
-    }
-
-    pub fn pool(&self) -> &ConnectionPool {
-        &self.pool
-    }
-
-    pub fn client(&self) -> reqwest::Client {
-        self.worker.client.client.clone()
+        assert_eq!(effective.downloader, Some(DownloaderType::SyncDownloader));
+        assert_eq!(effective.file_size, Some(global_size));
+        assert_eq!(
+            align_file_size(effective.file_size),
+            100 * 1024 * 1024,
+            "边录边传应按全局 100MB（10MiB 对齐后 100MiB）切段，而不是 2GiB 默认值"
+        );
     }
 }

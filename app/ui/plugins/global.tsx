@@ -1,52 +1,63 @@
 'use client'
-import React, { useEffect } from 'react'
+import React from 'react'
 import styles from '../../styles/dashboard.module.scss'
-import { Form, Select, Space, useFormApi } from '@douyinfe/semi-ui'
+import SectionTitle from '../../(app)/components/SectionTitle'
+import { Form, Select, Space, useFormState } from '@douyinfe/semi-ui'
 import { IconUpload, IconDownload } from '@douyinfe/semi-icons'
+import { FileSizeField } from '../FileSizeInput'
 
 const Global: React.FC = () => {
-  const formApi = useFormApi()
+  // useFormApi 不订阅表单值变化，切换下拉框后条件渲染不会刷新；useFormState 会
+  const { values } = useFormState()
+  const isSyncDownloader = values?.downloader === 'sync-downloader'
 
   return (
     <>
       {/* 全局下载 */}
       <div className={styles.frameDownload}>
-        <div className={styles.frameInside}>
-          <div className={styles.group}>
-            <div className={styles.buttonOnlyIconSecond} />
-            <div
-              className={styles.lineStory}
-              style={{
-                color: 'var(--semi-color-bg-0)',
-                display: 'flex',
-              }}
-            >
-              <IconDownload size="small" />
-            </div>
-          </div>
-          <p className={styles.meegoSharedWebWorkIt}>全局下载设置</p>
-        </div>
+        <SectionTitle icon={<IconDownload size="small" />} title="全局下载设置" />
         <Form.Select
           label="下载插件（downloader）"
           field="downloader"
-          placeholder="stream-gears（默认）"
-          // initValue="stream-gears"
+          placeholder="mesio（默认）"
           extraText={
             <div style={{ fontSize: '14px' }}>
-              选择全局默认的下载插件, 可选:
+              全局默认的下载插件，可在单个主播的覆写设置里另选。可选：
               <br />
-              1. streamlink（仅限 hls 流，不支持的流将回退到 ffmpeg。非 Docker 用户需自行安装 FFmpeg）
+              1. <strong>mesio</strong>（默认）：内置 rust-srec 引擎，无需额外安装。进程内下载 FLV / HLS，修复时间戳（每段从
+              0 开始）、写入关键帧索引（onMetaData.keyframes），支持 HEVC 和 hls_fmp4；不转封装，按源站的容器保存（FLV /
+              TS，hls_fmp4 存为 .mp4）。详见{' '}
+              <a
+                href="https://github.com/hua0512/rust-srec"
+                target="_blank"
+                rel="noopener noreferrer"
+                style={{ color: 'var(--semi-color-link)' }}
+              >
+                项目主页
+              </a>
+              。
               <br />
-              2. ffmpeg（非 Docker 用户需自行安装 FFmpeg）
+              2. ffmpeg：非 Docker 用户需自行安装 FFmpeg。
               <br />
-              3. stream-gears（默认。防 FLV 流花屏）
+              3. streamlink：多线程下载 HLS 分片，也可下载 FLV 直链；需系统中有 streamlink 命令。
               <br />
-              4. sync-downloader（流式边录边传，需先为主播设定上传模板。不受
-              pool2/threads/segment_time 控制，默认 3 线程上传，请确保上传带宽充足。非 Docker 用户需自行安装 FFmpeg）详见 Wiki <a href="https://github.com/biliup/biliup/wiki/%E8%BE%B9%E5%BD%95%E8%BE%B9%E4%BC%A0%E5%8A%9F%E8%83%BD" target="_blank" rel="noopener noreferrer" >点击查看</a>
+              4. sync-downloader（边录边传）：录制的同时流式上传，<strong>需先为主播设置上传模板</strong>；不受
+              pool2 / threads / segment_time 控制，固定 3 线程上传，请确保上传带宽充足；非 Docker 用户需自行安装
+              FFmpeg。详见 Wiki{' '}
+              <a
+                href="https://github.com/biliup/biliup/wiki/%E8%BE%B9%E5%BD%95%E8%BE%B9%E4%BC%A0%E5%8A%9F%E8%83%BD"
+                target="_blank"
+                rel="noopener noreferrer"
+                style={{ color: 'var(--semi-color-link)' }}
+              >
+                边录边传功能
+              </a>
+              。
               <br />
-              5. ytarchive（仅适用于 Youtube Live）
+              5. ytarchive：仅适用于 YouTube 直播。
               <br />
-              {/* 6. mesio（基于 Rust 的命令行视频下载/修复器）详见 <a href="https://github.com/hua0512/rust-srec/tree/main/mesio-cli" target="_blank" rel="noopener noreferrer" >项目主页</a> */}
+              6. stream-gears：内置，无需额外安装，可防 FLV 流花屏；不支持 HEVC 编码和 hls_fmp4 流，FLV
+              时间戳沿用源站的原值（不从 0 开始）。
             </div>
           }
           style={{ width: '100%' }}
@@ -58,12 +69,12 @@ const Global: React.FC = () => {
         >
           <Select.Option value="streamlink">streamlink（hls多线程下载）</Select.Option>
           <Select.Option value="ffmpeg">ffmpeg</Select.Option>
-          <Select.Option value="stream-gears">stream-gears（默认）</Select.Option>
+          <Select.Option value="stream-gears">stream-gears</Select.Option>
           <Select.Option value="sync-downloader">sync-downloader（边录边传）</Select.Option>
           <Select.Option value="ytarchive">ytarchive（仅适用于 Youtube Live）</Select.Option>
-          {/* <Select.Option value="mesio">mesio</Select.Option> */}
+          <Select.Option value="mesio">mesio（默认）</Select.Option>
         </Form.Select>
-        {formApi.getValue('downloader') === 'sync-downloader' ? (
+        {isSyncDownloader ? (
           <>
             <Form.Input
               field="sync_save_dir"
@@ -75,7 +86,6 @@ const Global: React.FC = () => {
                 padding: 0,
               }}
               showClear={true}
-              disabled={formApi.getValue('downloader') === 'sync-downloader' ? false : true}
               rules={[
                 {
                   pattern: /^[^*|?"<>]*$/,
@@ -106,19 +116,16 @@ const Global: React.FC = () => {
             />
           </>
         ) : null}
-        <Form.InputNumber
+        <FileSizeField
           label="视频分段大小（file_size）"
           extraText={
             <div style={{ fontSize: '14px' }}>
-              录像单文件大小限制，超过此大小触发文件分割。下载回放时无法使用。
+              录像单文件大小上限，超过后开始写下一个文件。下载回放时无法使用。留空表示不按大小分段。
               <br />
-              单位：Byte，示例：4294967296（4GB）
+              按 1024 进制换算：1 GB = 1024 MB = 1073741824 字节，与 Windows 资源管理器显示的大小一致。配置文件里存的仍是字节数。
             </div>
           }
           field="file_size"
-          placeholder=""
-          suffix={'Byte'}
-          style={{ width: '100%' }}
           fieldStyle={{
             alignSelf: 'stretch',
             padding: 0,
@@ -151,7 +158,7 @@ const Global: React.FC = () => {
               message: '只接受数字和英文冒号',
             },
             {
-              pattern: /^[0-9]{2,4}:[0-5][0-9]:[0-5][0-9]$/,
+              pattern: /^$|^[0-9]{2,4}:[0-5][0-9]:[0-5][0-9]$/,
               message: '分或秒不符合规范',
             },
           ]}
@@ -258,27 +265,41 @@ const Global: React.FC = () => {
           }}
           showClear={true}
         />
+        <Form.Select
+          field="preview_transport"
+          label="直播预览取流方式（preview_transport）"
+          extraText={
+            <div style={{ fontSize: '14px' }}>
+              <div>
+                <strong>经 biliup 中转</strong>（默认）：页面里的预览复用正在录制的那一路流，不向直播平台多拉一路。
+                浏览器与 biliup 在同一台机器或同一内网时选这个，不多占 CDN 带宽。
+              </div>
+              <div>
+                <strong>浏览器直连 CDN</strong>：biliup 向平台另取一条直链（新 token，不影响录制那条），浏览器自己去
+                CDN 拉，媒体流量不经过 biliup，适合 biliup 部署在异地服务器、浏览器远程访问的情况，省服务器出口带宽。
+                只有 CDN 放行跨域的平台能直连（B 站 / 抖音 / 斗鱼 / 虎牙，FLV 与 HLS 都行）；Twitch 等按 Origin 白名单放行
+                的平台在直连模式下自动回落中转并在播放器角标标出原因。
+              </div>
+            </div>
+          }
+          placeholder="经 biliup 中转（relay）"
+          style={{ width: '100%' }}
+          fieldStyle={{
+            alignSelf: 'stretch',
+            padding: 0,
+          }}
+          showClear={true}
+        >
+          <Form.Select.Option value="relay">经 biliup 中转（relay）</Form.Select.Option>
+          <Form.Select.Option value="direct">浏览器直连 CDN（direct）</Form.Select.Option>
+        </Form.Select>
       </div>
 
       <Space />
 
       {/* 全局上传 */}
       <div className={styles.frameUpload}>
-        <div className={styles.frameInside}>
-          <div className={styles.group}>
-            <div className={styles.buttonOnlyIconSecond} />
-            <div
-              className={styles.lineStory}
-              style={{
-                color: 'var(--semi-color-bg-0)',
-                display: 'flex',
-              }}
-            >
-              <IconUpload size="small" />
-            </div>
-          </div>
-          <p className={styles.meegoSharedWebWorkIt}>全局上传设置</p>
-        </div>
+        <SectionTitle icon={<IconUpload size="small" />} title="全局上传设置" />
 
         <Form.Select
           field="submit_api"
@@ -316,7 +337,7 @@ const Global: React.FC = () => {
         <Form.Select
           field="lines"
           label="上传线路（lines）"
-          extraText="b站上传线路选择，默认为自动模式，可手动切换为bda, bda2, ws, qn, bldsa, tx, txa"
+          extraText="b站上传线路选择，默认为自动模式，可手动切换为alia, bda2, bldsa, tx, txa, estx, akbd"
           placeholder="AUTO（自动，默认）"
           style={{ width: '100%' }}
           fieldStyle={{
@@ -327,12 +348,12 @@ const Global: React.FC = () => {
         >
           <Form.Select.Option value="AUTO">AUTO（自动，默认）</Form.Select.Option>
           <Form.Select.Option value="alia">alia（海外-阿里云）</Form.Select.Option>
-          {/* <Form.Select.Option value="bda">bda</Form.Select.Option> */}
           <Form.Select.Option value="bda2">bda2（大陆-百度云）</Form.Select.Option>
           <Form.Select.Option value="bldsa">bldsa（大陆-B站自建）</Form.Select.Option>
-          <Form.Select.Option value="qn">qn（全球-七牛）</Form.Select.Option>
           <Form.Select.Option value="tx">tx（大陆-腾讯云）</Form.Select.Option>
           <Form.Select.Option value="txa">txa（海外-腾讯云）</Form.Select.Option>
+          <Form.Select.Option value="estx">estx（大陆-B站自建）</Form.Select.Option>
+          <Form.Select.Option value="akbd">akbd（大陆-B站自建）</Form.Select.Option>
         </Form.Select>
         <Form.InputNumber
           field="threads"

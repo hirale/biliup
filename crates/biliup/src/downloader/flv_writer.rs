@@ -9,7 +9,7 @@ use serde::Serialize;
 use std::fs::File;
 use std::io::{BufWriter, Write};
 
-use tracing::info;
+use tracing::{error, info};
 
 const FLV_HEADER: [u8; 9] = [
     0x46, // 'F'
@@ -23,6 +23,8 @@ const FLV_HEADER: [u8; 9] = [
 pub struct FlvFile<'a> {
     pub buf_writer: BufWriter<File>,
     pub file: LifecycleFile<'a>,
+    /// 当前分段已交给 [`LifecycleFile::finish`]，`Drop` 不再重复改名、触发钩子。
+    finished: bool,
 }
 
 impl<'a> FlvFile<'a> {
@@ -32,14 +34,23 @@ impl<'a> FlvFile<'a> {
         Ok(Self {
             buf_writer: Self::create(path)?,
             file,
+            finished: false,
         })
     }
 
+    /// 结束当前分段并开始下一个。当前分段 flush 失败时返回错误，不再开新文件。
     pub fn create_new(&mut self) -> std::io::Result<()> {
-        self.file.rename();
+        self.finish()?;
         let path = self.file.create()?;
         self.buf_writer = Self::create(path)?;
+        self.finished = false;
         Ok(())
+    }
+
+    /// flush 并检查错误 → 去掉 `.part` → 触发钩子，见 [`LifecycleFile::finish`]。
+    fn finish(&mut self) -> std::io::Result<()> {
+        self.finished = true;
+        self.file.finish(&mut self.buf_writer)
     }
 
     fn create<P: AsRef<std::path::Path>>(path: P) -> std::io::Result<BufWriter<File>> {
@@ -68,7 +79,12 @@ impl<'a> FlvFile<'a> {
     ) -> std::io::Result<usize> {
         self.write_tag_header(tag_header)?;
         self.buf_writer.write_all(body)?;
-        self.buf_writer.write(previous_tag_size)
+        // write 允许部分写入，短写会静默丢字节并破坏 FLV 结构，必须用 write_all
+        self.buf_writer.write_all(previous_tag_size)?;
+        self.file
+            .bytes_written
+            .add((11 + body.len() + previous_tag_size.len()) as u64);
+        Ok(previous_tag_size.len())
     }
 
     pub fn write_tag_header(&mut self, tag_header: &TagHeader) -> std::io::Result<()> {
@@ -86,13 +102,19 @@ impl<'a> FlvFile<'a> {
         writer: &mut impl Write,
         previous_tag_size: u32,
     ) -> std::io::Result<usize> {
-        writer.write(&previous_tag_size.to_be_bytes())
+        let bytes = previous_tag_size.to_be_bytes();
+        writer.write_all(&bytes)?;
+        Ok(bytes.len())
     }
 }
 
 impl Drop for FlvFile<'_> {
     fn drop(&mut self) {
-        self.file.rename()
+        if !self.finished
+            && let Err(e) = self.finish()
+        {
+            error!("{e}");
+        }
     }
 }
 
@@ -104,7 +126,8 @@ pub struct FlvTag<'a> {
 
 pub fn to_json<T: ?Sized + Serialize>(mut writer: impl Write, t: &T) -> std::io::Result<usize> {
     serde_json::to_writer(&mut writer, t)?;
-    writer.write("\n".as_ref())
+    writer.write_all(b"\n")?;
+    Ok(1)
 }
 
 #[derive(Debug, PartialEq, Serialize)]
@@ -123,4 +146,40 @@ pub enum TagDataHeader<'a> {
         composition_time: Option<i32>,
     },
     Script(ScriptData<'a>),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 模拟每次调用最多接受 1 字节的 Writer。
+    /// 对这类 Writer，`write` 只写入部分数据也返回 Ok，必须用 `write_all` 才能保证完整写入。
+    struct ShortWriter(Vec<u8>);
+
+    impl Write for ShortWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            let take = buf.len().min(1);
+            self.0.extend_from_slice(&buf[..take]);
+            Ok(take)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn previous_tag_size_is_fully_written_even_on_short_writes() {
+        let mut writer = ShortWriter(Vec::new());
+        let written = FlvFile::write_previous_tag_size(&mut writer, 0x0102_0304).unwrap();
+        assert_eq!(written, 4);
+        assert_eq!(writer.0, [0x01, 0x02, 0x03, 0x04]);
+    }
+
+    #[test]
+    fn to_json_writes_trailing_newline_even_on_short_writes() {
+        let mut writer = ShortWriter(Vec::new());
+        to_json(&mut writer, &serde_json::json!({"k": "v"})).unwrap();
+        assert!(writer.0.ends_with(b"\n"));
+    }
 }
