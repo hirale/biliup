@@ -3,8 +3,8 @@
 # Segment paths arrive on stdin. With empty stdin it only retries sessions whose
 # upload failed earlier. Keep this as the last postprocessor step: the source
 # segments and the MP4 are deleted once every remote holds a verified copy.
-# A literal {rand} in a remote is replaced by a random token fixed per session,
-# so a public download URL reveals nothing about other sessions' paths.
+# The MP4 is named <first segment>_<random token>.mp4 so a public download URL
+# cannot be guessed from another session's URL or from the recording time.
 
 set -euo pipefail
 
@@ -107,7 +107,7 @@ remux_session() {
 # Uploads one session to every remote and deletes the local files only when
 # every copy verifies by hash; a size-only match does not count.
 archive_session() {
-  local session_file="$1" stem check_log template remote rel token=""
+  local session_file="$1" stem check_log remote rel
   local -a outputs=() sources=()
   stem=$(basename "$session_file" .session)
 
@@ -115,7 +115,6 @@ archive_session() {
     case "$kind" in
       out) outputs+=("$value") ;;
       src) sources+=("$value") ;;
-      rand) token=$value ;;
     esac
   done <"$session_file"
 
@@ -124,32 +123,25 @@ archive_session() {
   done
   printf '%s\n' "${outputs[@]}" >"$tmp_dir/files.txt"
 
-  # Logs name the template, not the resolved path, to keep tokens out of them.
-  for template in "${remotes[@]}"; do
-    if [[ "$template" == *'{rand}'* ]]; then
-      [[ -n "$token" ]] || { log "$stem: session has no rand token"; return 1; }
-      remote=${template//'{rand}'/$token}
-    else
-      remote=$template
-    fi
-    log "$stem: uploading to $template"
+  for remote in "${remotes[@]}"; do
+    log "$stem: uploading to $remote"
     rclone copy "$archive_dir" "$remote" --files-from-raw "$tmp_dir/files.txt" \
       --s3-no-check-bucket --stats 5m --stats-one-line --stats-log-level NOTICE \
-      || { log "$stem: upload to $template failed"; return 1; }
+      || { log "$stem: upload to $remote failed"; return 1; }
 
     check_log="$tmp_dir/check.log"
     if ! rclone check "$archive_dir" "$remote" --one-way \
         --files-from-raw "$tmp_dir/files.txt" >"$check_log" 2>&1; then
       cat "$check_log" >&2
-      log "$stem: verification against $template failed"
+      log "$stem: verification against $remote failed"
       return 1
     fi
     if grep -Eq '[1-9][0-9]* hash(es)? could not be checked' "$check_log"; then
       cat "$check_log" >&2
-      log "$stem: $template has no comparable hash; refusing to trust a size-only match"
+      log "$stem: $remote has no comparable hash; refusing to trust a size-only match"
       return 1
     fi
-    log "$stem: verified on $template"
+    log "$stem: verified on $remote"
   done
 
   # Session file first: an interruption after this leaves stray files, never a
@@ -199,9 +191,8 @@ if ((${#segments[@]} > 0)); then
     log "$current_stem was already remuxed; retrying its upload"
   else
     declare -a session_outputs=()
-    remux_session "$current_stem" "${segments[@]}"
+    remux_session "${current_stem}_$(od -An -N12 -tx1 /dev/urandom | tr -d ' \n')" "${segments[@]}"
     {
-      printf 'rand\t%s\n' "$(od -An -N12 -tx1 /dev/urandom | tr -d ' \n')"
       printf 'src\t%s\n' "${segments[@]}"
       printf 'out\t%s\n' "${session_outputs[@]}"
     } >"$archive_dir/$current_stem.session.tmp"
