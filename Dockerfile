@@ -57,6 +57,8 @@ VOLUME /opt
 # 需要遵守 wheel 文件名规范
 COPY --from=wheel-builder /biliup/target/wheels/* /tmp/
 COPY --from=wheel-builder /biliup/scripts /opt/scripts
+# /opt is usually bind-mounted, which hides /opt/scripts; this copy stays reachable.
+COPY --from=wheel-builder /biliup/scripts /usr/local/share/biliup/scripts
 
 RUN set -eux; \
 	\
@@ -117,6 +119,24 @@ RUN set -eux; \
 			ffmpeg*; \
 		chmod a+x /usr/local/* ; \
 	fi; \
+	\
+	# rclone 同样固定版本并校验 SHA-256（来自 downloads.rclone.org 的 SHA256SUMS）。
+	rclone_url='https://downloads.rclone.org/v1.75.1/rclone-v1.75.1-linux-'; \
+	case "$arch" in \
+		'amd64') rclone_sha256='982b5aa772841168f8e380f139e9e787b2a105403e32b94da8676a0e1c0a13ab' ;; \
+		'arm64') rclone_sha256='03f2504174034b6d004152ed7369251c9a9ec1f7e0836eda420f5c7a5ec0dff9' ;; \
+		*) rclone_sha256='' ;; \
+	esac; \
+	if [ -n "$rclone_sha256" ]; then \
+		wget -O rclone.zip "${rclone_url}${arch}.zip" --progress=dot:giga; \
+		echo "$rclone_sha256  rclone.zip" | sha256sum -c -; \
+		python3 -m zipfile -e rclone.zip rclone-extract; \
+		install -m 0755 rclone-extract/rclone-*/rclone /usr/local/bin/rclone; \
+		rm -rf rclone.zip rclone-extract; \
+	else \
+		apt-get install -y --no-install-recommends rclone; \
+	fi; \
+	rclone version; \
 	\
 	# Clean up \
 	[ -z "$savedAptMark" ] || apt-mark manual $savedAptMark; \
