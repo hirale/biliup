@@ -40,11 +40,35 @@ media_duration() {
   awk -v d="${dur:-0}" -v s="${start:-0}" 'BEGIN{r=d-s; if (r < 0) r=d; printf "%.3f", r}'
 }
 
-# Stream copy cannot drop content silently except by truncation, so a short
-# output is the one failure worth checking for.
 duration_matches() {
   local expected="$1" actual="$2"
   awk -v e="$expected" -v a="$actual" 'BEGIN{exit (e <= 0 || a >= e * 0.97) ? 0 : 1}'
+}
+
+# Duration of the first stream of type v or a, from its last packet; works
+# without ffprobe, which the image does not ship.
+stream_duration() {
+  ffmpeg -nostdin -hide_banner -v error -i "$1" -map "0:$2:0" -c copy -f null -progress pipe:1 - 2>/dev/null \
+    | sed -n 's/^out_time_us=\([0-9]*\)$/\1/p' | tail -1 | awk '{printf "%.3f", $1 / 1e6}' || true
+}
+
+# The container duration is the longest stream, so it hides a stream that
+# stops early (2026-10-03: video ended after the first of two segments while
+# audio ran on). Every stream type in the reference file must reach $expected.
+streams_complete() {
+  local file="$1" expected="$2" ref="$3" type label actual info
+  # ffmpeg -i always exits non-zero without an output, which pipefail would
+  # turn into "no such stream".
+  info=$(ffmpeg -hide_banner -i "$ref" 2>&1 || true)
+  for type in v a; do
+    [[ $type == v ]] && label=Video || label=Audio
+    grep -q "Stream #.*: $label:" <<<"$info" || continue
+    actual=$(stream_duration "$file" "$type")
+    if ! duration_matches "$expected" "${actual:-0}"; then
+      log "$(basename "$file"): $label stream is ${actual:-0}s, expected ${expected}s"
+      return 1
+    fi
+  done
 }
 
 # Codec, resolution and audio layout per stream; bitrates are left out because
@@ -75,12 +99,13 @@ remux_session() {
   if ((same_params)) && ffmpeg -hide_banner -loglevel error -y -f concat -safe 0 -i "$list" \
       -map "0:v?" -map "0:a?" -c copy -f mp4 "$part"; then
     actual=$(media_duration "$part")
-    if duration_matches "$expected" "$actual"; then
+    if ! duration_matches "$expected" "$actual"; then
+      log "Concatenated output is ${actual}s, expected ${expected}s"
+    elif streams_complete "$part" "$expected" "${segments[0]}"; then
       mv "$part" "$archive_dir/$stem.mp4"
       session_outputs=("$stem.mp4")
       return 0
     fi
-    log "Concatenated output is ${actual}s, expected ${expected}s"
   fi
   rm -f "$part"
 
@@ -99,6 +124,8 @@ remux_session() {
     actual=$(media_duration "$archive_dir/$out.part")
     duration_matches "$(media_duration "$seg")" "$actual" \
       || fail "remuxed $out is truncated (${actual}s)"
+    streams_complete "$archive_dir/$out.part" "$(media_duration "$seg")" "$seg" \
+      || fail "remuxed $out is missing stream data; keeping $seg"
     mv "$archive_dir/$out.part" "$archive_dir/$out"
     session_outputs+=("$out")
   done
