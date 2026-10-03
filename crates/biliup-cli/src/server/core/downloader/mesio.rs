@@ -18,7 +18,7 @@ use flv::{CodecKind, FlvData};
 use flv_fix::{
     ContinuityMode, FlvPipeline, FlvPipelineConfig, FlvWriter, FlvWriterConfig, ScriptFillerConfig,
 };
-use futures::{Stream, StreamExt, stream};
+use futures::{Stream, StreamExt, future, stream};
 use hls::HlsData;
 use hls_fix::{HlsPipeline, HlsPipelineConfig, HlsWriter, HlsWriterConfig};
 use mesio_engine::flv::FlvProtocolConfig;
@@ -41,6 +41,11 @@ use tracing::{debug, info, warn};
 
 /// 管线内部通道容量（条目数），与 mesio-cli 默认值一致。
 const CHANNEL_SIZE: usize = 64;
+
+/// 视频断流阈值（流时间）：音频照常推进而视频停住这么久，就结束本次拉流，
+/// 让下载循环重新解析直链重连。正常流里音视频交错，相差只有几十毫秒。
+/// 2026-10-03 B 站 CDN 重连后只下发音频，flv-fix 只打 WARN，白录了两个多小时。
+const VIDEO_STALL_MS: u32 = 10_000;
 
 /// 分段回调载荷：已关闭的分段文件路径、0 起始的序号、时长（秒）与字节数。
 type SegmentClosed = (PathBuf, u32, f64, u64);
@@ -150,7 +155,8 @@ impl Mesio {
                     handle,
                 } = session;
                 let event_task = tokio::spawn(log_events(events));
-                let items = items.map(|r| r.map_err(|e| PipelineError::Strategy(Box::new(e))));
+                let items = stop_on_video_stall(items)
+                    .map(|r| r.map_err(|e| PipelineError::Strategy(Box::new(e))));
                 let preview = download_config.preview.attach(PreviewFormat::Flv);
                 let outcome = run_pipeline::<FlvPipeline, _>(
                     &pipeline_config,
@@ -423,6 +429,56 @@ where
         Ok(stats) => Ok(stats),
         Err(RunCompletionError::Writer(e)) => Err(format!("writer: {e}")),
         Err(RunCompletionError::Pipeline(e)) => Err(format!("pipeline: {e}")),
+    }
+}
+
+/// 视频断流时提前结束 FLV 输入流。管线照常收尾、关闭当前分段，下载器返回
+/// `StreamEnded`，房间仍在直播时下载循环会立即重新解析直链。
+fn stop_on_video_stall<S, E>(items: S) -> impl Stream<Item = Result<FlvData, E>>
+where
+    S: Stream<Item = Result<FlvData, E>>,
+{
+    let mut guard = VideoStallGuard::default();
+    items.take_while(move |item| future::ready(!matches!(item, Ok(data) if guard.stalled(data))))
+}
+
+/// 按流时间判定视频断流。从未出现过视频帧的流（纯音频直播）不会触发。
+#[derive(Default)]
+struct VideoStallGuard {
+    seen_video: bool,
+    /// 最近一个视频帧之后第一个音频 tag 的时间戳
+    audio_since_video: Option<u32>,
+}
+
+impl VideoStallGuard {
+    fn stalled(&mut self, item: &FlvData) -> bool {
+        let FlvData::Tag(tag) = item else {
+            return false;
+        };
+        if tag.is_video_tag() && !tag.is_video_sequence_header() {
+            self.seen_video = true;
+            self.audio_since_video = None;
+            return false;
+        }
+        if !tag.is_audio_tag() || !self.seen_video {
+            return false;
+        }
+        let now = tag.timestamp_ms;
+        match self.audio_since_video {
+            // 时间戳回退（流内重置）时重新起算，宁可晚判也不误判
+            Some(start) if now >= start => {
+                let stalled_ms = now - start;
+                if stalled_ms >= VIDEO_STALL_MS {
+                    warn!(
+                        stalled_ms,
+                        "视频已停止而音频仍在推进，结束本次拉流以重新解析直链"
+                    );
+                    return true;
+                }
+            }
+            _ => self.audio_since_video = Some(now),
+        }
+        false
     }
 }
 
@@ -860,6 +916,87 @@ mod tests {
         );
         let sub = pending.await.unwrap().unwrap();
         assert_eq!(sub.snapshot, vec![init, seg2]);
+    }
+
+    fn flv_tag(tag_type: flv::FlvTagType, ts: u32, data: &'static [u8]) -> FlvData {
+        FlvData::Tag(flv::FlvTag::new(
+            ts,
+            0,
+            tag_type,
+            false,
+            bytes::Bytes::from_static(data),
+        ))
+    }
+
+    fn audio(ts: u32) -> FlvData {
+        flv_tag(flv::FlvTagType::Audio, ts, &[0xaf, 0x01, 0x21])
+    }
+
+    fn video(ts: u32) -> FlvData {
+        flv_tag(flv::FlvTagType::Video, ts, &[0x27, 0x01, 0, 0, 0, 0xb1])
+    }
+
+    fn video_sequence_header(ts: u32) -> FlvData {
+        flv_tag(
+            flv::FlvTagType::Video,
+            ts,
+            &[0x17, 0x00, 0, 0, 0, 0x01, 0x64],
+        )
+    }
+
+    /// 2026-10-03 的形态：重连后先有一小段视频，之后只剩音频。
+    #[tokio::test]
+    async fn flv_input_ends_once_video_stalls_while_audio_continues() {
+        let mut items = vec![video_sequence_header(0)];
+        for ts in (0..16_000).step_by(40) {
+            items.push(video(ts));
+            items.push(audio(ts + 5));
+        }
+        for ts in (16_000..60_000).step_by(23) {
+            items.push(audio(ts));
+        }
+        let total = items.len();
+        let kept: Vec<_> = stop_on_video_stall(stream::iter(items.into_iter().map(Ok::<_, ()>)))
+            .collect()
+            .await;
+        assert!(kept.len() < total);
+        let FlvData::Tag(last) = kept.last().unwrap().as_ref().unwrap() else {
+            panic!("expected a tag");
+        };
+        assert!(last.is_audio_tag());
+        assert!(
+            (25_000..26_100).contains(&last.timestamp_ms),
+            "{}",
+            last.timestamp_ms
+        );
+    }
+
+    #[test]
+    fn video_stall_guard_ignores_healthy_and_audio_only_streams() {
+        let mut guard = VideoStallGuard::default();
+        for ts in (0..120_000).step_by(33) {
+            assert!(!guard.stalled(&video(ts)));
+            assert!(!guard.stalled(&audio(ts)));
+        }
+
+        // 纯音频直播，或只有视频序列头没有视频帧：不算见过视频
+        let mut guard = VideoStallGuard::default();
+        assert!(!guard.stalled(&video_sequence_header(0)));
+        for ts in (0..120_000).step_by(23) {
+            assert!(!guard.stalled(&audio(ts)));
+        }
+    }
+
+    #[test]
+    fn video_stall_guard_restarts_on_audio_timestamp_reset() {
+        let mut guard = VideoStallGuard::default();
+        assert!(!guard.stalled(&video(500_000)));
+        assert!(!guard.stalled(&audio(500_000)));
+        assert!(!guard.stalled(&audio(509_000)));
+        // 回退到 0 后重新起算，不能当成断流
+        assert!(!guard.stalled(&audio(0)));
+        assert!(!guard.stalled(&audio(9_000)));
+        assert!(guard.stalled(&audio(10_000)));
     }
 
     #[test]
