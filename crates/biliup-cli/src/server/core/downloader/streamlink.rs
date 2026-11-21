@@ -6,9 +6,10 @@ use crate::tools;
 use biliup::downloader::util::ByteCounter;
 use error_stack::ResultExt;
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::process::{ExitStatus, Stdio};
 use std::sync::Arc;
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::process::{Child, ChildStdout};
 use tokio::sync::RwLock;
 use tokio::time::Duration;
@@ -58,7 +59,15 @@ impl Streamlink {
         mut callback: Box<dyn FnMut(SegmentEvent) + Send + Sync + 'a>,
         download_config: DownloadConfig,
     ) -> AppResult<DownloadStatus> {
-        let output_file = download_config.generate_output_filename(&download_config.suffix);
+        // Streamlink writes the selected stream verbatim. A requested suffix
+        // cannot remux it; name the completed file from its actual header.
+        let name = download_config.recorder.generate_filename_in(
+            &download_config.output_dir,
+            &["streamlink", "flv", "ts", "mp4", "mkv", "webm"],
+        );
+        let output_file = download_config
+            .output_dir
+            .join(format!("{name}.streamlink"));
         let part_file = format!("{}.part", output_file.display());
         let args = self
             .streamlink_downloader
@@ -73,6 +82,9 @@ impl Streamlink {
 
         info!(cmd = %redact_process_debug(&cmd), "Starting streamlink download");
         let child = cmd.spawn().change_context(AppError::Unknown)?;
+        callback(SegmentEvent::Start {
+            next_file_path: PathBuf::from(&part_file),
+        });
         let status = spawn_log(
             child,
             &self.process_handle,
@@ -84,6 +96,13 @@ impl Streamlink {
             .await
             .change_context(AppError::Unknown)?
         {
+            let actual = recorded_container(std::path::Path::new(&part_file)).await?;
+            let output_file = output_file.with_extension(actual);
+            if output_file.exists() {
+                return Err(
+                    AppError::Custom(format!("输出文件已存在，保留临时录像: {part_file}")).into(),
+                );
+            }
             tokio::fs::rename(&part_file, &output_file)
                 .await
                 .change_context(AppError::Custom(String::from("退出时，重命名文件")))?;
@@ -109,6 +128,45 @@ impl Streamlink {
             child.kill().await.change_context(AppError::Unknown)?;
         }
         Ok(())
+    }
+}
+
+async fn recorded_container(path: &std::path::Path) -> AppResult<&'static str> {
+    let file = tokio::fs::File::open(path)
+        .await
+        .change_context(AppError::Unknown)?;
+    let mut header = Vec::new();
+    file.take(4096)
+        .read_to_end(&mut header)
+        .await
+        .change_context(AppError::Unknown)?;
+    container_from_header(&header).ok_or_else(|| {
+        AppError::Custom(format!(
+            "无法识别 streamlink 实际容器，已保留录像，不按配置后缀伪装格式: {}",
+            path.display()
+        ))
+        .into()
+    })
+}
+
+fn container_from_header(header: &[u8]) -> Option<&'static str> {
+    if header.starts_with(b"FLV") {
+        Some("flv")
+    } else if header.starts_with(&[0x1a, 0x45, 0xdf, 0xa3]) {
+        Some(if header.windows(4).any(|w| w == b"webm") {
+            "webm"
+        } else {
+            "mkv"
+        })
+    } else if header
+        .get(4..8)
+        .is_some_and(|kind| matches!(kind, b"ftyp" | b"styp"))
+    {
+        Some("mp4")
+    } else if [0, 188, 376].iter().all(|&i| header.get(i) == Some(&0x47)) {
+        Some("ts")
+    } else {
+        None
     }
 }
 
@@ -374,7 +432,6 @@ impl StreamOutput {
     }
 }
 
-
 /// Rewrite already-resolved progressive HTTP(S) media URLs so Streamlink's
 /// built-in `http` plugin matches them.
 ///
@@ -538,6 +595,25 @@ async fn spawn_log(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn native_container_is_detected_without_trusting_the_configured_suffix() {
+        assert_eq!(super::container_from_header(b"FLV\x01"), Some("flv"));
+        assert_eq!(
+            super::container_from_header(b"\x00\x00\x00\x18ftypisom"),
+            Some("mp4")
+        );
+        assert_eq!(
+            super::container_from_header(b"\x1a\x45\xdf\xa3webm"),
+            Some("webm")
+        );
+        let mut ts = vec![0; 564];
+        for i in [0, 188, 376] {
+            ts[i] = 0x47;
+        }
+        assert_eq!(super::container_from_header(&ts), Some("ts"));
+        assert_eq!(super::container_from_header(b"error page"), None);
+    }
+
     use super::*;
     use crate::server::common::util::Recorder;
     use crate::server::infrastructure::models::StreamerInfo;
@@ -557,6 +633,7 @@ mod tests {
             suffix: "flv".to_string(),
             bytes_written: ByteCounter::new(),
             preview: Default::default(),
+            index_tap: None,
         }
     }
 
@@ -586,10 +663,7 @@ mod tests {
     #[test]
     fn progressive_flv_gets_httpstream_prefix() {
         let url = "https://cdn.example/live/abc.flv?wsSecret=sig&wsTime=1";
-        assert_eq!(
-            streamlink_cli_url(url),
-            format!("httpstream://{url}")
-        );
+        assert_eq!(streamlink_cli_url(url), format!("httpstream://{url}"));
     }
 
     #[test]
@@ -652,7 +726,8 @@ mod tests {
             )
             .expect("args");
         assert!(
-            args.iter().any(|a| a == "httpstream://https://cdn.example/live.flv?sig=1"),
+            args.iter()
+                .any(|a| a == "httpstream://https://cdn.example/live.flv?sig=1"),
             "expected httpstream URL in args: {args:?}"
         );
         assert!(args.iter().any(|a| a == "best"));

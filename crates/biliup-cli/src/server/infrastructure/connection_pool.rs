@@ -25,10 +25,11 @@ struct SupersededMigration {
     repair: &'static [&'static str],
 }
 
-/// 迁移文件是只读历史：sqlx 会用文件内容的 SHA-384 校验每条已应用的迁移，一旦
+/// 已发布的迁移文件是只读历史：sqlx 会用文件内容的 SHA-384 校验每条已应用的迁移，一旦
 /// 就地改写，所有老库都会在启动时以
 /// `migration N was previously applied but has been modified` 整体失败 —— 服务起不来，
-/// 容器无限重启（#1701 / #1702）。修 SQL 的正确做法始终是新增一个迁移文件。
+/// 容器无限重启（#1701 / #1702）。修改已发布结构须新增迁移；未发布功能的中间迁移
+/// 应合并成最终结构，不登记开发过程中的摘要或为临时工程添加升级路径。
 ///
 /// 这张表只给**已经发生过**的改写兜底，不是继续改写的许可。登记一条的前提是：
 /// 对已经跑过旧内容的库来说，新旧内容的差异能用下面这组幂等语句补齐。
@@ -49,6 +50,15 @@ const SUPERSEDED_MIGRATIONS: &[SupersededMigration] = &[
     },
 ];
 
+/// MostlyHarmlessxyz/biliup 分支曾在上游之前把 tid_v2 作为迁移 4 发布，上游随后把迁移 4
+/// 用于清理 `file_size` 占位 null，tid_v2 挪到了迁移 5。用过该分支的库里，迁移 4 记的是
+/// 下面这段 SQL 的摘要，且 tid_v2 列已经存在。
+const FORK_TID_V2_MIGRATION: (i64, &str) = (
+    4,
+    "ALTER TABLE uploadstreamers ADD COLUMN tid_v2 INTEGER;\n",
+);
+const FORK_TID_V2_SUCCESSOR: i64 = 5;
+
 /// 连接管理器
 /// 负责管理SQLite数据库连接池的创建和配置
 pub struct ConnectionManager;
@@ -62,31 +72,7 @@ impl ConnectionManager {
     /// # 返回
     /// 返回配置好的SQLite连接池
     pub async fn new_pool(path: &str) -> AppResult<ConnectionPool> {
-        // 创建所有父级目录（如果不存在）
-        if let Some(parent) = Path::new(path).parent() {
-            std::fs::create_dir_all(parent)
-                .change_context(AppError::Unknown)
-                .attach_with(|| path.to_string())?; // 创建 data/ 目录
-        }
-
-        let db_url = format!("sqlite://{path}");
-
-        // 创建数据库文件（如果不存在）
-        std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(path)
-            .change_context(AppError::Unknown)?;
-
-        // 创建连接池，最大连接数设为2
-        let pool = SqlitePoolOptions::new()
-            .max_connections(2)
-            .connect(&db_url)
-            .await
-            .change_context(AppError::Custom(
-                "error while initializing the database connection pool".to_string(),
-            ))?;
+        let pool = Self::connect(path).await?;
 
         // 运行数据库迁移，确保数据库结构是最新的
         let migrator = sqlx::migrate!();
@@ -97,6 +83,76 @@ impl ConnectionManager {
             "error while running database migrations".to_string(),
         ))?;
 
+        Ok(pool)
+    }
+
+    /// 打开一个独立于主库、用自己那套迁移的 SQLite 库（如控制面的 `data/fleet.sqlite3`）。
+    ///
+    /// 这套迁移从一开始就是 LF、从未被就地改写过，所以不做主库那套历史校验和对齐：
+    /// 任何失配都直接交给 sqlx 报错。
+    pub async fn new_pool_with(path: &str, migrator: &Migrator) -> AppResult<ConnectionPool> {
+        let pool = Self::connect(path).await?;
+        migrator
+            .run(&pool)
+            .await
+            .change_context(AppError::Custom(format!(
+                "error while running database migrations for {path}"
+            )))?;
+        Ok(pool)
+    }
+
+    async fn connect(path: &str) -> AppResult<ConnectionPool> {
+        // 创建所有父级目录（如果不存在）
+        if let Some(parent) = Path::new(path).parent() {
+            std::fs::create_dir_all(parent)
+                .change_context(AppError::Unknown)
+                .attach_with(|| path.to_string())?; // 创建 data/ 目录
+        }
+
+        let db_url = format!("sqlite://{path}");
+
+        // 创建数据库文件（如果不存在）
+        let mut options = std::fs::OpenOptions::new();
+        // Cookie refresh tickets live in this database. New databases must not
+        // become world-readable with a permissive process umask.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        options
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)
+            .change_context(AppError::Unknown)?;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            // Upgrades add long-lived passport credentials to existing DBs too.
+            // Tighten existing database and SQLite sidecars before connecting.
+            for file in [
+                path.to_owned(),
+                format!("{path}-wal"),
+                format!("{path}-shm"),
+            ] {
+                match std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound && file != path => {}
+                    Err(error) => return Err(error).change_context(AppError::Unknown),
+                }
+            }
+        }
+
+        // 创建连接池，最大连接数设为2
+        let pool = SqlitePoolOptions::new()
+            .max_connections(2)
+            .connect(&db_url)
+            .await
+            .change_context(AppError::Custom(
+                "error while initializing the database connection pool".to_string(),
+            ))?;
         Ok(pool)
     }
 
@@ -125,6 +181,7 @@ impl ConnectionManager {
         if bookkeeping_exists.is_none() {
             return Ok(());
         }
+        Self::adopt_fork_tid_v2_migration(pool, migrator).await?;
 
         // 没跑过（含跑失败留下的记录）的迁移由 sqlx 正常应用，不需要对齐。
         let applied: Vec<(i64, Vec<u8>)> = sqlx::query_as(
@@ -203,6 +260,83 @@ impl ConnectionManager {
 
         Ok(())
     }
+
+    /// 迁移 4 若记的是分支版 tid_v2 迁移（见 [`FORK_TID_V2_MIGRATION`]），在同一个事务里：
+    /// 补跑当前迁移 4（幂等的占位 null 清理），把迁移 4 的记录对齐到当前内容；tid_v2 列
+    /// 已经存在、迁移 5 尚未记录时，把迁移 5 记为已应用，免得重复加列失败。
+    async fn adopt_fork_tid_v2_migration(
+        pool: &ConnectionPool,
+        migrator: &Migrator,
+    ) -> AppResult<()> {
+        let err = || AppError::Custom("error while reconciling database migration state".into());
+        let (version, legacy_sql) = FORK_TID_V2_MIGRATION;
+        let applied: Option<Vec<u8>> = sqlx::query_scalar(
+            "SELECT checksum FROM _sqlx_migrations WHERE version = ? AND success = TRUE",
+        )
+        .bind(version)
+        .fetch_optional(pool)
+        .await
+        .change_context_lazy(err)?;
+        let Some(applied) = applied else {
+            return Ok(());
+        };
+        let find = |v: i64| {
+            migrator
+                .iter()
+                .find(|m| m.version == v && !m.migration_type.is_down_migration())
+        };
+        let (Some(current), Some(successor)) = (find(version), find(FORK_TID_V2_SUCCESSOR)) else {
+            return Ok(());
+        };
+        let legacy = Migration::new(
+            version,
+            Cow::Borrowed("add tid v2"),
+            current.migration_type,
+            Cow::Borrowed(legacy_sql),
+            false,
+        );
+        if applied != legacy.checksum.as_ref() && applied != crlf_checksum(&legacy) {
+            return Ok(());
+        }
+
+        let mut tx = pool.begin().await.change_context_lazy(err)?;
+        sqlx::query(current.sql.as_ref())
+            .execute(&mut *tx)
+            .await
+            .change_context_lazy(err)?;
+        sqlx::query("UPDATE _sqlx_migrations SET checksum = ?, description = ? WHERE version = ?")
+            .bind(current.checksum.to_vec())
+            .bind(current.description.as_ref())
+            .bind(version)
+            .execute(&mut *tx)
+            .await
+            .change_context_lazy(err)?;
+        let column_exists: Option<i64> = sqlx::query_scalar(
+            "SELECT 1 FROM pragma_table_info('uploadstreamers') WHERE name = 'tid_v2'",
+        )
+        .fetch_optional(&mut *tx)
+        .await
+        .change_context_lazy(err)?;
+        if column_exists.is_some() {
+            sqlx::query(
+                "INSERT OR IGNORE INTO _sqlx_migrations \
+                 (version, description, success, checksum, execution_time) \
+                 VALUES (?, ?, TRUE, ?, 0)",
+            )
+            .bind(successor.version)
+            .bind(successor.description.as_ref())
+            .bind(successor.checksum.to_vec())
+            .execute(&mut *tx)
+            .await
+            .change_context_lazy(err)?;
+        }
+        tx.commit().await.change_context_lazy(err)?;
+        info!(
+            version,
+            "迁移 4 记录的是分支版 tid_v2 迁移，已对齐到上游迁移 4/5"
+        );
+        Ok(())
+    }
 }
 
 /// 同一份迁移内容以 CRLF 检出时 sqlx 会记下的校验和。
@@ -234,6 +368,33 @@ fn hex_lower(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{ConnectionManager, ConnectionPool, crlf_checksum, hex_lower};
+    use sqlx::migrate::Migrator;
+    use std::borrow::Cow;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn database_credentials_are_private_on_creation_and_upgrade() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("private.sqlite3");
+        let pool = ConnectionManager::new_pool(path.to_str().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        pool.close().await;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let pool = ConnectionManager::new_pool(path.to_str().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        pool.close().await;
+    }
 
     /// v1.1.8 ~ v1.2.4 发布包给迁移 2（改写前的内容）记下的摘要：Linux / macOS / Docker
     /// 包是 LF 检出，Windows 包是在 `windows-latest` 上以 CRLF 检出后编的。
@@ -311,6 +472,58 @@ mod tests {
                 6,
                 "11d73df52e3a459d5256d4f5d624cbc5e891d14c358d1ef4a63debae235c2fd24ce2fe8745a85ac95312ad4773475ca2",
             ),
+            (
+                7,
+                "66fd3bd6b5d4aab82389bbe03e190ff869f274aa8fdc74ee9110f277ff1dcae237a4b6a2088c84f4d31e997c34badc03",
+            ),
+            (
+                8,
+                "edff6c311dbece198eec1e0e4aa55983c56996d9b5ea2a7b352b479dd71149ccfe52145a2178ed52b33fc4ddc4c5ea3e",
+            ),
+            (
+                9,
+                "50962387ef63bab0ce70701139798580f8e6d82cfc8fbd80fc601c638e6649b25763b439c636da84bc9c7a142642ccfa",
+            ),
+            (
+                10,
+                "6a37aaac20f18ea3e0a9cdb1a6bb971882eb843b5569ea26897a61f328d0813176efebf788d4e8b188f4cf3dd4db2fc6",
+            ),
+            (
+                11,
+                "d0b03f1d85267c90184bb260970affe744114d40a5f06e020604bca39307cf13cceebc6401c8d1b8cb47d7162040846e",
+            ),
+            (
+                12,
+                "53b87607fc5effda086366a3aa1023e7c273895c363229074fc77b915159838ff8ca90d24cb929536d9c87003c66f7fa",
+            ),
+            (
+                13,
+                "3723224e71b1a9857324048be4f9285af75d2a9b76b0bf314d3b81d04ba412540e9eb28f7defdcd535b0fb969698152d",
+            ),
+            (
+                14,
+                "207150b7a466885c0938452490143426063ac93209ebf697e6cb7dae243c9fa98474d71c6cb223b3d0dcd6e7862ebdf5",
+            ),
+            (
+                15,
+                "651bdccbe5c26daf608c9edcaf49ff21070e1918a03747fc9f04448c80d19d8925b93f95adc89daf0944ace4adcc906c",
+            ),
+            (
+                16,
+                "d535d3f1d70a8d59f0cf03f9cc320a998c0c7c713da0064f340206891fcb6453293cbc0692f618f79213fba6aee7512a",
+            ),
+            (
+                17,
+                "7186a4ca1c54defbcab04f485f2365fb1677e346703c0f5d5bfd3cd6b7d8208895be4608024585dbb73a7e0463b548ec",
+            ),
+            (
+                18,
+                "dd77be0c39401b245fb8291a6db4b0b3a7c56c9ca62ebf4ad0764afdb3f937b121bb25feb6c0febb79abd7b5c5aa8f18",
+            ),
+            (
+                19,
+                "517da1681f3b9277489924d659e02874800b5c59a97f014e7fbd86eadf11634b90db7e5aaff398147157244d7afde462",
+            ),
         ];
         let embedded = sqlx::migrate!();
         let actual: Vec<(i64, String)> = embedded
@@ -375,12 +588,12 @@ mod tests {
                 .fetch_all(&pool)
                 .await
                 .unwrap();
+        let embedded = sqlx::migrate!();
         assert_eq!(
             migrations.iter().map(|m| m.0).collect::<Vec<_>>(),
-            vec![1, 2, 3, 4, 5, 6],
+            embedded.iter().map(|m| m.version).collect::<Vec<_>>(),
             "待应用的迁移必须补齐"
         );
-        let embedded = sqlx::migrate!();
         for (version, checksum) in &migrations {
             let expected = embedded.iter().find(|m| m.version == *version).unwrap();
             assert_eq!(
@@ -408,6 +621,95 @@ mod tests {
             .fetch_all(&pool)
             .await
             .expect("迁移 5 必须已应用");
+    }
+
+    #[tokio::test]
+    async fn upgrade_from_a_pre_squash_database_seeds_monotonic_session_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("data.sqlite3");
+        let pool = ConnectionManager::connect(db.to_str().unwrap())
+            .await
+            .unwrap();
+        let embedded = sqlx::migrate!();
+        let through_14 = Migrator {
+            migrations: Cow::Owned(
+                embedded
+                    .iter()
+                    .filter(|migration| migration.version <= 14)
+                    .cloned()
+                    .collect(),
+            ),
+            ..Migrator::DEFAULT
+        };
+        through_14.run(&pool).await.unwrap();
+        for id in [12_i64, 95] {
+            sqlx::query(
+                "INSERT INTO stream_sessions(id,name,url,title,date,live_cover_path) \
+                 VALUES(?, 'legacy', 'https://example.test', 'legacy', '2026-10-11', '')",
+            )
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        pool.close().await;
+
+        let pool = ConnectionManager::new_pool(db.to_str().unwrap())
+            .await
+            .expect("a pre-squash database must apply the merged migration");
+        let applied: Vec<i64> =
+            sqlx::query_scalar("SELECT version FROM _sqlx_migrations ORDER BY version")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            applied,
+            embedded.iter().map(|m| m.version).collect::<Vec<_>>()
+        );
+        let seeded: Vec<i64> = sqlx::query_scalar("SELECT id FROM stream_session_ids ORDER BY id")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert_eq!(seeded, vec![12, 95]);
+        let after_seed = crate::server::workbench::store::allocate_session_id(&pool)
+            .await
+            .unwrap();
+        assert_eq!(after_seed, 96);
+
+        // Legacy writers that still insert into stream_sessions are taken into account by the
+        // next open_session-style allocation.
+        sqlx::query(
+            "INSERT INTO stream_sessions(id,name,url,title,date,live_cover_path) \
+             VALUES(120, 'legacy', 'https://example.test', 'legacy', '2026-10-11', '')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let reserved = crate::server::workbench::store::allocate_session_id(&pool)
+            .await
+            .unwrap();
+        assert_eq!(reserved, 121);
+        sqlx::query(
+            "INSERT INTO stream_sessions(id,name,url,title,date,live_cover_path) \
+             VALUES(?, 'new', 'https://example.test', 'new', '2026-10-11', '')",
+        )
+        .bind(reserved)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("DELETE FROM stream_sessions WHERE id = ?")
+            .bind(reserved)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let after_delete = crate::server::workbench::store::allocate_session_id(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            after_delete, 122,
+            "deleting the largest session must not reuse its ID"
+        );
     }
 
     /// v1.2.5 起的 Windows 发布包（以及 Windows 本地构建）建立的库：内容与当前完全一致，
@@ -551,6 +853,211 @@ mod tests {
         assert!(rows[2].1.is_none());
     }
 
+    /// v1.2.8（迁移 1–6）建立的库升级：`streamerinfo` 改名为 `stream_sessions`，数据、外键、
+    /// 用户自己加的索引 / 视图 / 触发器都跟着改名，`/v1/streamer-info` 读到的内容不变。
+    #[tokio::test]
+    async fn upgrade_from_v1_2_8_renames_streamerinfo_to_stream_sessions() {
+        use crate::server::infrastructure::models::{FileItem, StreamerInfo};
+        use chrono::DateTime;
+        use ormlite::Model;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("data.sqlite3");
+        let legacy = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect(&format!("sqlite://{}?mode=rwc", db.display()))
+            .await
+            .unwrap();
+        let mut v1_2_8 = sqlx::migrate!();
+        v1_2_8.migrations = v1_2_8
+            .migrations
+            .iter()
+            .filter(|m| m.version <= 6)
+            .cloned()
+            .collect::<Vec<_>>()
+            .into();
+        v1_2_8.run(&legacy).await.unwrap();
+        let rfc3339 = "2026-09-23T10:00:00.123456789+00:00";
+        let python = "2024-01-02 03:04:05.678000";
+        for sql in [
+            // Python 版建的库没有强制外键，可能留有孤儿 filelist 行
+            "PRAGMA foreign_keys = OFF",
+            "INSERT INTO livestreamers (id, url, remark) VALUES \
+             (1, 'https://www.douyu.com/9999', 'douyu'), (2, 'https://live.bilibili.com/6', 'bili')",
+            &format!(
+                "INSERT INTO streamerinfo (id, name, url, title, date, live_cover_path) VALUES \
+                 (1, 'douyu', 'https://www.douyu.com/9999', '第一场', '{rfc3339}', ''), \
+                 (2, 'bili', 'https://live.bilibili.com/6', '老数据', '{python}', 'cover.jpg'), \
+                 (3, 'gone', 'https://www.huya.com/gone', '主播已删', '{rfc3339}', '')"
+            ),
+            "INSERT INTO filelist (id, file, streamer_info_id) VALUES \
+             (1, 'a.flv', 1), (2, 'b.flv', 1), (3, 'c.mp4', 2), (4, 'orphan.flv', 99)",
+            "CREATE INDEX idx_user_filelist ON filelist (streamer_info_id)",
+            "CREATE VIEW v_user AS SELECT s.title, f.file FROM streamerinfo s \
+             JOIN filelist f ON f.streamer_info_id = s.id",
+            "CREATE TRIGGER trg_user AFTER UPDATE OF title ON streamerinfo BEGIN \
+             UPDATE filelist SET file = file WHERE streamer_info_id = new.id; END",
+        ] {
+            sqlx::query(sql).execute(&legacy).await.unwrap();
+        }
+        legacy.close().await;
+
+        let pool = ConnectionManager::new_pool(db.to_str().unwrap())
+            .await
+            .expect("v1.2.8 建立的库必须能升级上来");
+
+        let versions: Vec<i64> =
+            sqlx::query_scalar("SELECT version FROM _sqlx_migrations ORDER BY version")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            versions,
+            sqlx::migrate!()
+                .iter()
+                .map(|m| m.version)
+                .collect::<Vec<_>>()
+        );
+        let tables: Vec<String> = sqlx::query_scalar(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN \
+             ('streamerinfo', 'stream_sessions', 'session_streamerinfo', 'segments') ORDER BY name",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(tables, vec!["segments", "stream_sessions"]);
+
+        // 外键跟着表名、列名走，ON DELETE CASCADE 保留
+        let fk: (String, String, String) = sqlx::query_as(
+            "SELECT \"table\", \"from\", on_delete FROM pragma_foreign_key_list('filelist')",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            fk,
+            (
+                "stream_sessions".into(),
+                "session_id".into(),
+                "CASCADE".into()
+            )
+        );
+        for (name, needles) in [
+            ("idx_user_filelist", &["session_id"][..]),
+            ("v_user", &["stream_sessions", "session_id"][..]),
+            ("trg_user", &["stream_sessions", "session_id"][..]),
+        ] {
+            let sql: String = sqlx::query_scalar("SELECT sql FROM sqlite_master WHERE name = ?")
+                .bind(name)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            for needle in needles {
+                assert!(sql.contains(needle), "{name}: {sql}");
+            }
+            assert!(!sql.contains("streamer_info_id"), "{name}: {sql}");
+        }
+        let joined: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM v_user")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(joined, 3);
+        sqlx::query("UPDATE stream_sessions SET title = title WHERE id = 1")
+            .execute(&pool)
+            .await
+            .expect("触发器改名后仍可执行");
+
+        // 老数据：内容原样；按 url 找回主播，找不到为 NULL；结束时间记为开播时间
+        let history = StreamerInfo::select().fetch_all(&pool).await.unwrap();
+        assert_eq!(
+            history
+                .iter()
+                .map(|h| (h.id, h.title.as_str(), h.live_cover_path.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                (1, "第一场", ""),
+                (2, "老数据", "cover.jpg"),
+                (3, "主播已删", "")
+            ]
+        );
+        let rfc3339_ms = DateTime::parse_from_rfc3339(rfc3339)
+            .unwrap()
+            .timestamp_millis();
+        let python_ms = chrono::NaiveDateTime::parse_from_str(python, "%F %T%.f")
+            .unwrap()
+            .and_utc()
+            .timestamp_millis();
+        assert_eq!(history[0].date.timestamp_millis(), rfc3339_ms);
+        type Backfill = (Option<i64>, Option<i64>, Option<i64>, Option<i64>);
+        let backfill: Vec<Backfill> = sqlx::query_as(
+            "SELECT streamer_id, started_at, ended_at, retain_until FROM stream_sessions ORDER BY id",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            backfill,
+            vec![
+                (Some(1), None, Some(rfc3339_ms), None),
+                (Some(2), None, Some(python_ms), None),
+                (None, None, Some(rfc3339_ms), None),
+            ]
+        );
+        let json = serde_json::to_value(&history[1]).unwrap();
+        let keys: Vec<&str> = json
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(|k| k.as_str())
+            .collect();
+        assert_eq!(
+            keys,
+            vec!["date", "id", "live_cover_path", "name", "title", "url"],
+            "/v1/streamer-info 的字段不变"
+        );
+
+        let files = FileItem::select()
+            .where_("session_id = ?")
+            .bind(1)
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            files.iter().map(|f| f.file.as_str()).collect::<Vec<_>>(),
+            vec!["a.flv", "b.flv"]
+        );
+        assert_eq!(
+            serde_json::to_value(&files[0]).unwrap(),
+            serde_json::json!({"id": 1, "file": "a.flv", "streamer_info_id": 1}),
+            "/v1/streamer-info/files 的字段不变"
+        );
+        let orphans: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM filelist WHERE id = 4")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(orphans, 1, "迁移不检查、也不删除孤儿行");
+
+        sqlx::query("DELETE FROM stream_sessions WHERE id = 2")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let left: Vec<i64> = sqlx::query_scalar("SELECT id FROM filelist ORDER BY id")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert_eq!(left, vec![1, 2, 4], "删场次级联删文件记录");
+        sqlx::query("DELETE FROM livestreamers WHERE id = 1")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let streamer: Option<i64> =
+            sqlx::query_scalar("SELECT streamer_id FROM stream_sessions WHERE id = 1")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(streamer, None, "删主播只清空场次的主播外键");
+    }
+
     #[tokio::test]
     async fn identity_migration_fails_closed_on_multiple_existing_administrators() {
         let dir = tempfile::tempdir().unwrap();
@@ -594,5 +1101,86 @@ mod tests {
             count, 2,
             "migration must not pick an administrator implicitly"
         );
+    }
+
+    /// 分支版（迁移 4 = tid_v2）建立的库：迁移 4 的摘要失配、迁移 5 未记录但 tid_v2 列
+    /// 已存在。升级必须照常完成，模板数据不丢，覆写里的占位 null 被清掉。
+    #[tokio::test]
+    async fn upgrade_from_fork_tid_v2_migration_4() {
+        use super::{FORK_TID_V2_MIGRATION, Migration};
+        use std::borrow::Cow;
+
+        for crlf in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let db = dir.path().join("data.sqlite3");
+            let pool = ConnectionManager::new_pool(db.to_str().unwrap())
+                .await
+                .unwrap();
+            let embedded = sqlx::migrate!();
+            let current_4 = embedded.iter().find(|m| m.version == 4).unwrap();
+            let legacy = Migration::new(
+                4,
+                Cow::Borrowed("add tid v2"),
+                current_4.migration_type,
+                Cow::Borrowed(FORK_TID_V2_MIGRATION.1),
+                false,
+            );
+            let legacy_checksum = if crlf {
+                crlf_checksum(&legacy)
+            } else {
+                legacy.checksum.to_vec()
+            };
+            set_checksum(&pool, 4, &legacy_checksum).await;
+            sqlx::query("DELETE FROM _sqlx_migrations WHERE version = 5")
+                .execute(&pool)
+                .await
+                .unwrap();
+            sqlx::query(
+                "INSERT INTO uploadstreamers (template_name, title, tid, tid_v2, tags) \
+                 VALUES ('fork', 'keep me', 171, 1003, '[]')",
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO livestreamers (url, remark, override) VALUES \
+                 ('https://live.bilibili.com/1', 'placeholder', '{\"file_size\":null}')",
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+            pool.close().await;
+
+            let pool = ConnectionManager::new_pool(db.to_str().unwrap())
+                .await
+                .expect("分支版建立的库必须能升级上来");
+            let recorded: Vec<(i64, String)> =
+                sqlx::query_as("SELECT version, checksum FROM _sqlx_migrations ORDER BY version")
+                    .fetch_all(&pool)
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .map(|(v, c): (i64, Vec<u8>)| (v, hex_lower(&c)))
+                    .collect();
+            assert_eq!(
+                recorded,
+                embedded
+                    .iter()
+                    .map(|m| (m.version, hex_lower(&m.checksum)))
+                    .collect::<Vec<_>>()
+            );
+            let row: (String, i64, Option<i64>) = sqlx::query_as(
+                "SELECT title, tid, tid_v2 FROM uploadstreamers WHERE template_name = 'fork'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(row, ("keep me".to_string(), 171, Some(1003)));
+            let override_json: String = sqlx::query_scalar("SELECT override FROM livestreamers")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            assert!(!override_json.contains("file_size"), "{override_json}");
+        }
     }
 }

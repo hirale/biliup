@@ -5,7 +5,7 @@ use crate::server::infrastructure::permissions::Permission;
 use crate::server::infrastructure::policy::{Field, RouteRequirement, Subject};
 use crate::server::infrastructure::users::{AuthSession, Backend};
 use axum::Json;
-use axum::body::Body;
+use axum::body::{Body, HttpBody};
 use axum::extract::{FromRequestParts, MatchedPath, Request};
 use axum::http::request::Parts;
 use axum::http::{StatusCode, header};
@@ -149,9 +149,14 @@ pub async fn unrestricted(mut request: Request, next: Next) -> Response {
     next.run(request).await
 }
 
-/// 没有 `Content-Length` 的成功响应是流（SSE 弹幕、`/live` 媒体流）：会话失效后截断。
+/// 长度未知的成功响应是流（SSE 弹幕、`/live` 媒体流）：会话失效后截断。
+/// 整包响应（`Json` 等）在这一层还没有 `Content-Length` 头（hyper 写出时才按 `size_hint` 补），
+/// 只看头会把它们也包成流、改走 chunked。
 fn cut_off_when_revoked(response: Response, caller: &Caller) -> Response {
-    if !response.status().is_success() || response.headers().contains_key(header::CONTENT_LENGTH) {
+    if !response.status().is_success()
+        || response.headers().contains_key(header::CONTENT_LENGTH)
+        || response.body().size_hint().exact().is_some()
+    {
         return response;
     }
     let (parts, body) = response.into_parts();
@@ -168,7 +173,7 @@ mod tests {
     use axum::Router;
     use axum::http::Method;
     use axum::middleware::from_fn;
-    use axum::routing::{MethodRouter, delete, get, post, put};
+    use axum::routing::{MethodRouter, delete, get, patch, post, put};
     use axum_login::AuthManagerLayerBuilder;
     use tower::ServiceExt;
     use tower_sessions::SessionManagerLayer;
@@ -176,23 +181,55 @@ mod tests {
 
     /// 与 `router.rs` 同形的全部业务路由，处理函数一律返回 200，只看访问控制层的裁决。
     const ROUTES: &[(&str, &str)] = &[
+        ("GET", "/v1/activity-events"),
+        ("GET", "/v1/files/location"),
+        ("POST", "/v1/files/reveal"),
+        ("GET", "/v1/upload-queue"),
+        ("GET", "/v1/upload-queue/upload-1"),
+        ("GET", "/v1/session-merge-candidates"),
+        ("POST", "/v1/session-merge-candidates/1/confirm"),
+        ("POST", "/v1/session-merge-candidates/1/dismiss"),
+        ("POST", "/v1/session-groups"),
         ("GET", "/v1/streamers"),
+        ("GET", "/v1/streamers/page"),
+        ("GET", "/v1/overview"),
         ("POST", "/v1/streamers"),
         ("PUT", "/v1/streamers"),
         ("DELETE", "/v1/streamers/1"),
         ("PUT", "/v1/streamers/1/pause"),
         ("GET", "/v1/streamers/1/cover"),
         ("GET", "/v1/streamers/1/avatar"),
+        ("GET", "/v1/streamers/1/mosaic-frame"),
         ("GET", "/v1/streamers/1/live"),
         ("GET", "/v1/streamers/1/live-url"),
         ("GET", "/v1/streamers/1/danmaku"),
         ("GET", "/v1/danmaku"),
         ("GET", "/v1/ws/live-rates"),
         ("GET", "/v1/live-rates"),
+        ("GET", "/v1/sessions"),
+        ("GET", "/v1/sessions/1"),
+        ("DELETE", "/v1/sessions/1"),
+        ("GET", "/v1/sessions/1/keyframes"),
+        ("GET", "/v1/sessions/1/media"),
+        ("GET", "/v1/sessions/1/markers"),
+        ("POST", "/v1/sessions/1/markers"),
+        ("PATCH", "/v1/sessions/1/markers/1"),
+        ("DELETE", "/v1/sessions/1/markers/1"),
+        ("GET", "/v1/system-stats"),
+        ("GET", "/v1/sessions/1/clips"),
+        ("POST", "/v1/sessions/1/clips"),
+        ("PATCH", "/v1/sessions/1/clips/1"),
+        ("DELETE", "/v1/sessions/1/clips/1"),
+        ("GET", "/v1/clips/1"),
+        ("POST", "/v1/clips/1/export"),
+        ("GET", "/v1/clips/1/download"),
         ("GET", "/v1/configuration"),
         ("PUT", "/v1/configuration"),
+        ("GET", "/v1/douyu/auth/status"),
+        ("POST", "/v1/douyu/auth/refresh"),
         ("GET", "/v1/streamer-info"),
         ("GET", "/v1/streamer-info/files/1"),
+        ("PATCH", "/v1/sessions/1"),
         ("GET", "/v1/upload/streamers"),
         ("POST", "/v1/upload/streamers"),
         ("GET", "/v1/upload/streamers/1"),
@@ -226,7 +263,14 @@ mod tests {
         let operate = (true, false);
         let admin = (false, false);
         match (method, path) {
-            ("GET", "/v1/streamers")
+            ("GET", "/v1/activity-events")
+            | ("GET", "/v1/files/location")
+            | ("POST", "/v1/files/reveal")
+            | ("GET", "/v1/upload-queue")
+            | ("GET", "/v1/upload-queue/upload-1")
+            | ("GET", "/v1/streamers")
+            | ("GET", "/v1/streamers/page")
+            | ("GET", "/v1/overview")
             | ("GET", "/v1/streamers/1/cover")
             | ("GET", "/v1/streamers/1/avatar")
             | ("GET", "/v1/streamers/1/live")
@@ -235,6 +279,15 @@ mod tests {
             | ("GET", "/v1/danmaku")
             | ("GET", "/v1/ws/live-rates")
             | ("GET", "/v1/live-rates")
+            | ("GET", "/v1/sessions")
+            | ("GET", "/v1/sessions/1")
+            | ("GET", "/v1/sessions/1/keyframes")
+            | ("GET", "/v1/sessions/1/media")
+            | ("GET", "/v1/sessions/1/markers")
+            | ("GET", "/v1/system-stats")
+            | ("GET", "/v1/sessions/1/clips")
+            | ("GET", "/v1/clips/1")
+            | ("GET", "/v1/clips/1/download")
             | ("GET", "/v1/configuration")
             | ("GET", "/v1/streamer-info")
             | ("GET", "/v1/streamer-info/files/1")
@@ -246,16 +299,29 @@ mod tests {
             | ("GET", "/static/ds_update.log")
             | ("GET", "/static/a.flv")
             | ("GET", "/v1/ws/logs") => view,
-            ("POST", "/v1/streamers")
+            ("GET", "/v1/session-merge-candidates")
+            | ("POST", "/v1/session-merge-candidates/1/confirm")
+            | ("POST", "/v1/session-merge-candidates/1/dismiss")
+            | ("POST", "/v1/session-groups")
+            | ("POST", "/v1/streamers")
             | ("PUT", "/v1/streamers")
             | ("DELETE", "/v1/streamers/1")
             | ("PUT", "/v1/streamers/1/pause")
+            | ("PATCH", "/v1/sessions/1")
+            | ("DELETE", "/v1/sessions/1")
             | ("POST", "/v1/upload/streamers")
             | ("DELETE", "/v1/upload/streamers/1")
             | ("GET", "/v1/users")
             | ("GET", "/v1/users/1")
             | ("GET", "/bili/archive/pre")
-            | ("POST", "/v1/uploads") => operate,
+            | ("POST", "/v1/uploads")
+            | ("POST", "/v1/sessions/1/markers")
+            | ("PATCH", "/v1/sessions/1/markers/1")
+            | ("DELETE", "/v1/sessions/1/markers/1")
+            | ("POST", "/v1/sessions/1/clips")
+            | ("PATCH", "/v1/sessions/1/clips/1")
+            | ("DELETE", "/v1/sessions/1/clips/1")
+            | ("POST", "/v1/clips/1/export") => operate,
             _ => admin,
         }
     }
@@ -272,20 +338,66 @@ mod tests {
                 .delete(|| async { StatusCode::OK })
         };
         Router::new()
+            .route("/v1/activity-events", ok())
+            .route("/v1/files/location", ok())
+            .route("/v1/files/reveal", post(|| async { StatusCode::OK }))
+            .route("/v1/upload-queue", ok())
+            .route("/v1/upload-queue/{id}", ok())
+            .route("/v1/session-merge-candidates", ok())
+            .route(
+                "/v1/session-merge-candidates/{id}/confirm",
+                post(|| async { StatusCode::OK }),
+            )
+            .route(
+                "/v1/session-merge-candidates/{id}/dismiss",
+                post(|| async { StatusCode::OK }),
+            )
+            .route("/v1/session-groups", post(|| async { StatusCode::OK }))
             .route("/v1/streamers", any())
+            .route("/v1/streamers/page", ok())
+            .route("/v1/overview", ok())
             .route("/v1/streamers/{id}", delete(|| async { StatusCode::OK }))
             .route("/v1/streamers/{id}/pause", put(|| async { StatusCode::OK }))
             .route("/v1/streamers/{id}/cover", ok())
             .route("/v1/streamers/{id}/avatar", ok())
+            .route("/v1/streamers/{id}/mosaic-frame", ok())
             .route("/v1/streamers/{id}/live", ok())
             .route("/v1/streamers/{id}/live-url", ok())
             .route("/v1/streamers/{id}/danmaku", ok())
             .route("/v1/danmaku", ok())
             .route("/v1/ws/live-rates", ok())
             .route("/v1/live-rates", ok())
+            .route("/v1/sessions", ok())
+            .route("/v1/sessions/{id}", ok())
+            .route("/v1/sessions/{id}/keyframes", ok())
+            .route("/v1/sessions/{id}/media", ok())
+            .route(
+                "/v1/sessions/{id}/markers",
+                get(|| async { StatusCode::OK }).post(|| async { StatusCode::OK }),
+            )
+            .route(
+                "/v1/sessions/{id}/markers/{mid}",
+                patch(|| async { StatusCode::OK }).delete(|| async { StatusCode::OK }),
+            )
+            .route("/v1/system-stats", ok())
+            .route(
+                "/v1/sessions/{id}/clips",
+                get(|| async { StatusCode::OK }).post(|| async { StatusCode::OK }),
+            )
+            .route(
+                "/v1/sessions/{id}/clips/{cid}",
+                patch(|| async { StatusCode::OK }).delete(|| async { StatusCode::OK }),
+            )
+            .route("/v1/clips/{cid}", ok())
+            .route("/v1/clips/{cid}/export", post(|| async { StatusCode::OK }))
+            .route("/v1/clips/{cid}/download", ok())
             .route("/v1/configuration", any())
+            .route("/v1/douyu/auth/status", ok())
+            .route("/v1/douyu/auth/refresh", post(|| async { StatusCode::OK }))
             .route("/v1/streamer-info", ok())
             .route("/v1/streamer-info/files/{id}", ok())
+            .route("/v1/sessions/{id}", patch(|| async { StatusCode::OK }))
+            .route("/v1/sessions/{id}", delete(|| async { StatusCode::OK }))
             .route("/v1/upload/streamers", any())
             .route("/v1/upload/streamers/{id}", any())
             .route("/v1/users", any())
@@ -311,6 +423,10 @@ mod tests {
     }
 
     async fn app() -> (tempfile::TempDir, Backend, Router) {
+        app_with(stub_router()).await
+    }
+
+    async fn app_with(routes: Router) -> (tempfile::TempDir, Backend, Router) {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("data.sqlite3");
         let pool = ConnectionManager::new_pool(db.to_str().unwrap())
@@ -324,7 +440,7 @@ mod tests {
             SessionManagerLayer::new(session_store).with_secure(false),
         )
         .build();
-        let app = stub_router()
+        let app = routes
             .merge(crate::server::api::auth::router())
             .layer(auth_layer);
         (dir, backend, app)
@@ -539,5 +655,51 @@ mod tests {
             chunks += 1;
             assert!(chunks < 100, "会话失效后流应在一两个复查周期内结束");
         }
+    }
+
+    /// 经真实的 hyper 连接取一次，返回小写的响应头。
+    async fn raw_get(addr: &str, path: &str, cookie: &str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let request = format!(
+            "GET {path} HTTP/1.1\r\nHost: {addr}\r\nCookie: {cookie}\r\nConnection: close\r\n\r\n"
+        );
+        stream.write_all(request.as_bytes()).await.unwrap();
+        let mut raw = Vec::new();
+        stream.read_to_end(&mut raw).await.unwrap();
+        let raw = String::from_utf8_lossy(&raw).to_lowercase();
+        raw.split("\r\n\r\n").next().unwrap().to_string()
+    }
+
+    #[tokio::test]
+    async fn whole_responses_keep_content_length_and_streams_stay_chunked() {
+        let routes = Router::new()
+            .route(
+                "/v1/videos",
+                get(|| async { Json(serde_json::json!([{ "name": "a.flv" }])) }),
+            )
+            .route(
+                "/v1/danmaku",
+                get(|| async {
+                    let chunks = [Ok::<_, std::io::Error>(bytes::Bytes::from_static(b"x"))];
+                    Body::from_stream(futures::stream::iter(chunks))
+                }),
+            )
+            .route_layer(from_fn(require_permission));
+        let (_dir, backend, app) = app_with(routes).await;
+        seed(&backend).await;
+        let cookie = login(&app, "ro", "viewer-password").await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let json = raw_get(&addr, "/v1/videos", &cookie).await;
+        assert!(json.starts_with("http/1.1 200"), "{json}");
+        assert!(json.contains("content-length: 18"), "{json}");
+        assert!(!json.contains("transfer-encoding"), "{json}");
+
+        let stream = raw_get(&addr, "/v1/danmaku", &cookie).await;
+        assert!(stream.starts_with("http/1.1 200"), "{stream}");
+        assert!(stream.contains("transfer-encoding: chunked"), "{stream}");
     }
 }

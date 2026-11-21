@@ -21,6 +21,8 @@ export type Permission =
   | 'log.view'
   | 'file.view'
   | 'user.manage'
+  | 'clip.edit'
+  | 'node.manage'
 
 /** 同上，与后端 `Role` 对应 */
 export type Role = 'admin' | 'operator' | 'viewer'
@@ -46,6 +48,8 @@ export const PERMISSION_LABELS: Record<Permission, string> = {
   'log.view': '查看日志',
   'file.view': '查看录播文件',
   'user.manage': '管理用户',
+  'clip.edit': '管理标记、场次和切片',
+  'node.manage': '管理节点',
 }
 
 export interface Me {
@@ -57,6 +61,63 @@ export interface Me {
   permissions: Permission[]
   /** 未开启 `--auth` 时为 false：零鉴权，视为超级管理员 */
   auth_enabled: boolean
+  /** 本机提供 Fleet 控制面能力，在任务平台内显示节点管理入口 */
+  fleet_controller: boolean
+  /**
+   * 本机是加入了控制面的节点（或启用了「本机」节点的控制面）时才有：
+   * 哪些直播间与投稿模板由控制面托管（本机只读）
+   */
+  fleet_node?: FleetManaged
+  /** 本机被控制面移除过、原受管主播还暂停着等确认时才有 */
+  fleet_revoked?: FleetRevoked
+}
+
+export interface FleetRevoked {
+  /** 移除本机的控制面显示名 */
+  controller: string
+  /** 被移除的时间（毫秒） */
+  revoked_at: number
+  /** 转为本机自管并暂停、等确认恢复的直播间 id */
+  streamers: number[]
+  /** 控制面关闭自己的「本机」节点时没交出的直播间（不是被别的控制面移除） */
+  local?: boolean
+}
+
+export interface FleetManaged {
+  /** 控制面的显示名（relay 地址的主机名或控制面 ID 前缀）；「本机」节点为「本机」 */
+  controller: string
+  /** 控制面自己的「本机」节点：托管行是分派到本机的 Fleet 房间，到「任务平台 › 节点管理 › 房间」修改 */
+  local?: boolean
+  /** 托管的本地直播间 id */
+  streamers: number[]
+  /** 托管的本地投稿模板 id */
+  templates: number[]
+  /** 控制面在管这台机器的配置：空间配置页只读，Cookie、密码等本机密钥仍可保存 */
+  config?: boolean
+  /**
+   * 本机是一主一备里的节点那台时才有：对端就是 `controller` 那台。配对里的直播间与模板不算托管
+   * （不在上面两项里），在哪台改都行，两台之间双向同步；空间配置与 B 站账号同样同步
+   */
+  pair?: FleetPair
+}
+
+export interface FleetPair {
+  /** 本机此刻是上传主机（两台对调过）；否则是备机 */
+  primary: boolean
+  /** 配对里的本地直播间 id */
+  streamers: number[]
+  /** 配对里的本地投稿模板 id（配对里的直播间在用，本机不能删） */
+  templates: number[]
+}
+
+/** 配对行的徽标文字，按对端此刻是主机还是备机 */
+export function pairLabel(pair: FleetPair) {
+  return pair.primary ? '与备机同步' : '与主机同步'
+}
+
+/** 对端此刻的角色 */
+export function pairPeer(pair: FleetPair) {
+  return pair.primary ? '备机' : '主机'
 }
 
 /**
@@ -69,6 +130,9 @@ export function useMe() {
   const { data, error, isLoading } = useSWR<Me>(ME_KEY, fetcher, {
     revalidateOnFocus: true,
     dedupingInterval: 10_000,
+    // 被控制面托管的节点：托管哪些行随分派变化，定时刷新让只读标记跟上；
+    // 被移除后逐个恢复直播间也会缩短待恢复清单
+    refreshInterval: (latest) => (latest?.fleet_node || latest?.fleet_revoked ? 10_000 : 0),
   })
   const permissions = data?.permissions
   const can = (permission: Permission) => permissions?.includes(permission) ?? false

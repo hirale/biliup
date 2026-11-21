@@ -1,15 +1,16 @@
 use crate::server::errors::{AppError, AppResult};
 use crate::server::infrastructure::models::StreamerInfo;
 use crate::server::infrastructure::models::hook_step::HookStep;
+use crate::server::workbench::retention::{self, Disposal, Retention};
 use chrono::{Duration, Local};
 use error_stack::{ResultExt, bail};
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use tracing::{error, info};
 use url::Url;
-use regex::Regex;
-use std::sync::OnceLock;
 
 /// 录制器配置结构体
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -33,7 +34,10 @@ impl Recorder {
         if let Some(prefix) = &self.filename_prefix {
             self.template_with(prefix)
         } else {
-            format!("{}%Y-%m-%dT%H_%M_%S", self.streamer_info.name)
+            format!(
+                "{}%Y-%m-%dT%H_%M_%S",
+                escape_strftime(&self.streamer_info.name)
+            )
         }
     }
 
@@ -42,15 +46,23 @@ impl Recorder {
         sanitize_filename(&self.raw_template())
     }
 
+    /// 代入主播名、房间标题、直播间地址。它们是字面量，其中的 `%` 要转义，
+    /// 否则会被当成 strftime 占位符（见 [`escape_strftime`]）。
     fn template_with(&self, template: &str) -> String {
         template
-            .replace("{streamer}", &self.streamer_info.name)
-            .replace("{title}", &self.streamer_info.title)
-            .replace("{url}", &self.streamer_info.url)
+            .replace("{streamer}", &escape_strftime(&self.streamer_info.name))
+            .replace("{title}", &escape_strftime(&self.streamer_info.title))
+            .replace("{url}", &escape_strftime(&self.streamer_info.url))
     }
 
     /// 生成“基名”（不带扩展名），时间冲突时按秒+1继续尝试，直到唯一
     pub fn generate_filename(&self, suffix: &str) -> String {
+        self.generate_filename_in(Path::new("."), &[suffix])
+    }
+
+    /// Check only the exact candidate paths, including unfinished recordings.
+    /// Native downloaders may choose any of the supplied container extensions.
+    pub(crate) fn generate_filename_in(&self, dir: &Path, suffixes: &[&str]) -> String {
         let template = self.filename_template();
         let mut t = Local::now();
         let mut last = String::new();
@@ -63,7 +75,12 @@ impl Recorder {
             } else {
                 format!("{formatted}_{attempt}")
             };
-            if !path_with_suffix(&candidate, suffix).exists() {
+            if suffixes.iter().all(|suffix| {
+                !dir.join(path_with_suffix(&candidate, suffix)).exists()
+                    && !dir
+                        .join(path_with_suffix(&candidate, &format!("{suffix}.part")))
+                        .exists()
+            }) {
                 return candidate;
             }
             last = formatted;
@@ -109,6 +126,15 @@ impl Recorder {
 pub(crate) fn path_with_suffix(base: &str, suffix: &str) -> PathBuf {
     let suffix = suffix.trim_start_matches('.');
     PathBuf::from(format!("{base}.{suffix}"))
+}
+
+/// 把要原样出现在 strftime 模板里的文字中的 `%` 转义成 `%%`。
+///
+/// 模板随后交给 chrono / ffmpeg `-strftime` / mesio 展开，三者都把 `%%` 还原成 `%`。
+/// 不转义的话，标题里的 `%d` 会变成日期；`50% off`、结尾的 `100%` 这类不认识的占位符
+/// 更会让 chrono 的格式化报错，`to_string()` 直接 panic，录制或投稿任务随之崩掉。
+fn escape_strftime(text: &str) -> String {
+    text.replace('%', "%%")
 }
 
 /// 非法字符清洗（最小可用实现）
@@ -180,8 +206,9 @@ fn oauth_secret_re() -> &'static Regex {
 
 /// 生成弹幕文件名模板（包含时间格式占位符），并清洗非法字符
 pub fn danmaku_filename_template(filename_prefix: Option<&str>, name: &str) -> String {
+    let name = escape_strftime(name);
     let template = filename_prefix
-        .map(|prefix| prefix.replace("{streamer}", name))
+        .map(|prefix| prefix.replace("{streamer}", &name))
         .unwrap_or_else(|| format!("{}%Y-%m-%dT%H_%M_%S", name));
     sanitize_filename(&template)
 }
@@ -350,7 +377,10 @@ mod tests {
         let redacted = redact_secrets(raw);
         assert!(!redacted.contains("tok3n"), "{redacted}");
         assert!(!redacted.contains("hunter2"), "{redacted}");
-        assert!(redacted.contains(r#""Authorization=[redacted]""#), "{redacted}");
+        assert!(
+            redacted.contains(r#""Authorization=[redacted]""#),
+            "{redacted}"
+        );
         assert!(
             redacted.contains(r#""--niconico-password" "[redacted]""#),
             "{redacted}"
@@ -360,7 +390,8 @@ mod tests {
 
     #[test]
     fn redact_secrets_keeps_unrelated_args() {
-        let raw = r#""streamlink" "--hls-duration" "01:00:00" "https://example.com/live?sid=42" "best""#;
+        let raw =
+            r#""streamlink" "--hls-duration" "01:00:00" "https://example.com/live?sid=42" "best""#;
         assert_eq!(redact_secrets(raw), raw);
     }
 
@@ -373,6 +404,66 @@ mod tests {
 
         assert_eq!(recorder.format_title(), "streamer/live:archive");
         assert_eq!(recorder.format_filename(), "streamer_live_archive");
+    }
+
+    #[test]
+    fn native_output_names_avoid_actual_containers_and_unfinished_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let recorder = Recorder::new(
+            Some("Mr.Beast".into()),
+            StreamerInfo::new("s", "u", "t", Utc::now(), ""),
+        );
+        std::fs::write(dir.path().join("Mr.Beast.webm"), b"previous video").unwrap();
+        std::fs::write(dir.path().join("Mr.Beast_1.ts.part"), b"unfinished").unwrap();
+        std::fs::write(dir.path().join("unrelated.mp4"), b"unrelated").unwrap();
+        assert_eq!(
+            recorder.generate_filename_in(dir.path(), &["mp4", "webm", "ts"]),
+            "Mr.Beast_2",
+        );
+    }
+
+    /// 房间标题、主播名、直播间地址里的 `%` 是字面量，不能被当成 strftime 占位符：
+    /// `50% off`、结尾的 `100%`、百分号编码的地址会让 chrono 的格式化报错，
+    /// `to_string()` 直接 panic，录制任务（或投稿任务）随之崩掉。
+    #[test]
+    fn percent_signs_in_stream_metadata_are_literal() {
+        let date = chrono::DateTime::parse_from_rfc3339("2026-06-15T12:00:00Z")
+            .unwrap()
+            .to_utc();
+        let recorder = Recorder::new(
+            Some("{streamer}_{title}_%Y".to_string()),
+            StreamerInfo::new(
+                "100%主播",
+                "https://x.example/?q=%E4%B8%AD",
+                "50% off %d 100%",
+                date,
+                "",
+            ),
+        );
+        assert_eq!(recorder.format_filename(), "100%主播_50% off %d 100%_2026");
+        assert_eq!(recorder.format_title(), "100%主播_50% off %d 100%_2026");
+        assert_eq!(recorder.format("{url}"), "https://x.example/?q=%E4%B8%AD");
+        assert!(
+            recorder
+                .generate_filename("flv")
+                .starts_with("100%主播_50% off %d 100%_20")
+        );
+
+        // 没配文件名模板时用主播名打头
+        let recorder = Recorder::new(
+            None,
+            StreamerInfo::new("100%", "https://x.example/1", "t", date, ""),
+        );
+        assert!(recorder.format_filename().starts_with("100%2026-"));
+
+        // 弹幕文件名模板随后同样交给 strftime
+        let template = super::danmaku_filename_template(None, "50%主播");
+        assert!(
+            Utc::now()
+                .format(&template)
+                .to_string()
+                .starts_with("50%主播20")
+        );
     }
 
     #[test]
@@ -391,6 +482,8 @@ mod tests {
 pub struct FileValidator {
     min_size: u64,
     check_format: bool,
+    /// 给了就按切片工作台的引用与场次保留期决定过滤删除要不要推迟
+    retention: Option<Retention>,
 }
 
 impl FileValidator {
@@ -398,7 +491,13 @@ impl FileValidator {
         Self {
             min_size,
             check_format,
+            retention: None,
         }
+    }
+
+    pub fn with_retention(mut self, retention: Retention) -> Self {
+        self.retention = Some(retention);
+        self
     }
 }
 
@@ -407,13 +506,24 @@ impl Default for FileValidator {
         Self {
             min_size: 1024 * 1024 * 100, // 100MB minimum
             check_format: true,
+            retention: None,
         }
     }
 }
 
 impl FileValidator {
-    /// 验证文件有效性
-    pub fn validate(&self, path: &Path) -> AppResult<()> {
+    /// [`Self::validate`] 会不会因为文件太小把它过滤删除。
+    pub fn will_delete(&self, path: &Path) -> bool {
+        fs::metadata(path).is_ok_and(|m| m.len() < self.min_size)
+    }
+
+    /// 验证文件有效性。太小的文件在后台删掉，删之前先等 `settled` 完成（见
+    /// [`RecorderHandle::settled`](crate::server::workbench::recorder::RecorderHandle::settled)）。
+    pub fn validate(
+        &self,
+        path: &Path,
+        settled: impl Future<Output = ()> + Send + 'static,
+    ) -> AppResult<()> {
         let metadata = fs::metadata(path).change_context(AppError::Unknown)?;
 
         let size = metadata.len();
@@ -421,14 +531,24 @@ impl FileValidator {
         if size < self.min_size {
             let display = path.display();
             let path = path.to_owned();
+            let retention = self.retention.clone();
             tokio::spawn(async move {
-                let Ok(()) = HookStep::remove_file(&[&path])
-                    .await
-                    .inspect_err(|e| error!(e=?e))
-                else {
-                    return;
+                settled.await;
+                let removed = match &retention {
+                    Some(retention) => retention::remove(retention, &[&path])
+                        .await
+                        .map(|outcome| outcome.first() != Some(&Disposal::Deferred))
+                        .inspect_err(|e| error!(e=?e))
+                        .ok(),
+                    None => HookStep::remove_file(&[&path])
+                        .await
+                        .inspect_err(|e| error!(e=?e))
+                        .ok()
+                        .map(|()| true),
                 };
-                info!("过滤删除 - {}", path.display());
+                if removed == Some(true) {
+                    info!("过滤删除 - {}", path.display());
+                }
             });
             bail!(AppError::Custom(format!(
                 "File {display} too small: {size} bytes, minimum: {} bytes",
@@ -444,12 +564,46 @@ impl FileValidator {
         Ok(())
     }
 
+    /// Mandatory recording processors run before size filtering. A small
+    /// segment may be retained by a marker/session pin, so its local contents
+    /// still need masking even when it will never be uploaded.
+    pub(crate) fn validate_without_size(&self, path: &Path) -> AppResult<()> {
+        fs::metadata(path).change_context(AppError::Unknown)?;
+        if self.check_format {
+            self.validate_format(path)?;
+        }
+        Ok(())
+    }
+
+    /// External results must name a published video, never a recording `.part`
+    /// or playlist. The recording validator intentionally accepts those paths.
+    pub(crate) fn validate_completed_video(path: &Path) -> AppResult<()> {
+        let metadata = fs::metadata(path).change_context(AppError::Unknown)?;
+        let ext = path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if !metadata.is_file()
+            || metadata.len() == 0
+            || !matches!(ext.as_str(), "mp4" | "flv" | "ts" | "mkv" | "webm")
+        {
+            bail!(AppError::Custom(format!(
+                "不是已完成的视频文件: {}",
+                path.display()
+            )));
+        }
+        Ok(())
+    }
+
     fn validate_format(&self, path: &Path) -> AppResult<()> {
         // 简单的格式验证 - 检查扩展名
+        let masked = crate::server::common::processing::masking::masked_path(path);
+        let path = masked.as_path();
         if let Some(extension) = path.extension() {
             let ext = extension.to_string_lossy().to_lowercase();
             match ext.as_str() {
-                "mp4" | "flv" | "ts" | "m3u8" | "mkv" => Ok(()),
+                "mp4" | "flv" | "ts" | "m3u8" | "mkv" | "webm" => Ok(()),
                 _ => bail!(AppError::Custom(format!("Unsupported format: {}", ext))),
             }
         } else {

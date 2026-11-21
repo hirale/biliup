@@ -3,6 +3,7 @@ use crate::server::common::upload::{
     execute_postprocessor, initialize_upload_context, submit_to_bilibili, upload_byte_stream_parts,
     upload_single_file, with_live_cover_fallback,
 };
+use crate::server::common::upload_observation::{FileObservation, TaskObservation};
 use crate::server::common::util::Recorder;
 use crate::server::core::downloader::sync_downloader::{
     PumpResult, SyncDownloader, align_file_size, pump_chunks,
@@ -11,6 +12,8 @@ use crate::server::core::downloader::{DownloadConfig, DownloadStatus};
 use crate::server::errors::{AppError, AppResult};
 use crate::server::infrastructure::context::{Context, Stage, WorkerStatus};
 use crate::server::infrastructure::models::upload_streamer::UploadStreamer;
+use crate::server::workbench::recorder::{ClosedSegment, RecorderHandle};
+use crate::server::workbench::retention::{self, Retention};
 use biliup::bilibili::{BiliBili, Studio, Video};
 use biliup::uploader::line::UploadedStream;
 use bytes::Bytes;
@@ -44,11 +47,23 @@ pub(crate) struct SyncSession {
     cleaned_parts: usize,
     first_submit_uncertain: bool,
     postprocess_paths: Vec<PathBuf>,
+    recorder: Option<RecorderHandle>,
+    retention: Option<Retention>,
 }
 
 impl SyncSession {
     pub(crate) fn committed_parts(&self) -> usize {
         self.confirmed_parts
+    }
+
+    /// 把分段记进切片工作台的场次时间轴。
+    pub(crate) fn set_recorder(&mut self, recorder: RecorderHandle) {
+        self.recorder = Some(recorder);
+    }
+
+    /// 投稿确认后删临时分段时，按切片工作台的引用与「投稿后保留录像」推迟删除。
+    pub(crate) fn set_retention(&mut self, retention: Retention) {
+        self.retention = Some(retention);
     }
 }
 
@@ -75,6 +90,7 @@ struct PendingSegment {
     file: SegmentFile,
     pump: PumpResult,
     upload: JoinHandle<AppResult<UploadedStream>>,
+    observation: Option<FileObservation>,
 }
 
 struct ReadySegment {
@@ -97,22 +113,106 @@ pub(crate) async fn run_sync_pipeline(
         return Err(AppError::Custom("边录边传不支持 Noop 上传器".into()).into());
     }
 
+    let guard = crate::server::common::upload::observe_context(ctx, "sync", "sync", false);
+    if let Some(guard) = &guard {
+        guard.observation().phase("initializing");
+    }
     ctx.change_status(Stage::Upload, WorkerStatus::Pending)
         .await;
-    let result = run_inner(
-        downloader,
-        token,
-        ctx,
-        download_config,
-        &upload_config,
-        session,
-    )
-    .await;
+    let result = if let Some(guard) = &guard {
+        guard
+            .scope(run_inner(
+                downloader,
+                token,
+                ctx,
+                download_config,
+                &upload_config,
+                session,
+            ))
+            .await
+    } else {
+        run_inner(
+            downloader,
+            token,
+            ctx,
+            download_config,
+            &upload_config,
+            session,
+        )
+        .await
+    };
     ctx.change_status(Stage::Upload, WorkerStatus::Idle).await;
+    if let Some(guard) = guard {
+        let telemetry_result = result
+            .as_ref()
+            .map(|_| ())
+            .map_err(|error| format!("{error:#}"));
+        guard.finish_result(&telemetry_result);
+    }
     result
 }
 
 async fn run_inner(
+    downloader: &SyncDownloader,
+    token: CancellationToken,
+    ctx: &Context,
+    download_config: DownloadConfig,
+    upload_config: &UploadStreamer,
+    session: Arc<Mutex<SyncSession>>,
+) -> AppResult<DownloadStatus> {
+    let result = super::webhook::on_failure(
+        ctx,
+        run_upload_session(
+            downloader,
+            token,
+            ctx,
+            download_config,
+            upload_config,
+            session.clone(),
+        )
+        .await,
+    )
+    .await?;
+    // Keep the paths available for a subsequent attempt if the callback fails.
+    let paths = session.lock().await.postprocess_paths.clone();
+    if !super::downloaded::configured(ctx) {
+        execute_postprocessor(paths, ctx).await?;
+        session.lock().await.postprocess_paths.clear();
+    }
+    Ok(result)
+}
+
+/// Streaming submission has already happened; its session hook runs once when
+/// recording ends, before postprocessing any explicitly saved local files.
+pub(crate) async fn finish_downloaded_session(
+    session: &Arc<Mutex<SyncSession>>,
+    ctx: &Context,
+) -> AppResult<()> {
+    if !super::downloaded::configured(ctx) {
+        return Ok(());
+    }
+    let paths = session.lock().await.postprocess_paths.clone();
+    let files = paths
+        .into_iter()
+        .map(|video| super::downloaded::HookFile {
+            video,
+            danmaku: None,
+        })
+        .collect();
+    let files = super::downloaded::run(files, ctx).await?;
+    execute_postprocessor(
+        files
+            .iter()
+            .flat_map(super::downloaded::HookFile::paths)
+            .collect(),
+        ctx,
+    )
+    .await?;
+    session.lock().await.postprocess_paths.clear();
+    Ok(())
+}
+
+async fn run_upload_session(
     downloader: &SyncDownloader,
     token: CancellationToken,
     ctx: &Context,
@@ -170,16 +270,6 @@ async fn run_inner(
     // 正常结束（含取消）时 run_loop 已排空队列；这里只处理出错后残留的分段。
     abandon_pending(&mut pending, &mut ready).await;
 
-    // 取消（停止/暂停）同样是“本场录制结束”，已投稿分段的后处理照常执行
-    if result.is_ok() {
-        let paths = {
-            let mut state = session.lock().await;
-            std::mem::take(&mut state.postprocess_paths)
-        };
-        if !paths.is_empty() {
-            execute_postprocessor(paths, ctx).await?;
-        }
-    }
     result
 }
 
@@ -344,13 +434,25 @@ async fn record_segments(
 
         let (tx, rx) = async_channel::bounded::<Bytes>(STREAM_QUEUE_CAPACITY);
         let segment_ctx = upload_ctx.clone();
+        let observation = TaskObservation::current();
+        let file_observation = observation.as_ref().map(|task| task.file(&file_name, None));
+        let upload_file_observation = file_observation.clone();
         let upload = tokio::spawn(async move {
             let stream = rx.map(|chunk: Bytes| {
                 let len = chunk.len();
                 Ok((chunk, len))
             });
-            upload_byte_stream_parts(&segment_ctx, parcel, stream).await
+            let upload =
+                upload_byte_stream_parts(&segment_ctx, parcel, stream, upload_file_observation);
+            match observation {
+                Some(observation) => observation.scope(upload).await,
+                None => upload.await,
+            }
         });
+        let workbench = session.lock().await.recorder.clone();
+        if let Some(workbench) = &workbench {
+            workbench.opened(&path);
+        }
         let pump = pump_chunks(
             segment.stdout,
             segment.peeked,
@@ -367,6 +469,9 @@ async fn record_segments(
             Err(error) => {
                 upload.abort();
                 let _ = upload.await;
+                if let Some(observation) = &file_observation {
+                    observation.finish(Some(&format!("{error:#}")));
+                }
                 retain_or_remove(&SegmentFile { path, keep }).await;
                 return Err(error);
             }
@@ -378,12 +483,29 @@ async fn record_segments(
             stream_complete = pump.stream_complete,
             "本段录制结束"
         );
+        if let Some(workbench) = &workbench {
+            workbench.closed(
+                &path,
+                ClosedSegment {
+                    bytes: Some(pump.actual_size),
+                    discard: pump.actual_size < MIN_MEDIA_BYTES && !keep,
+                    ..Default::default()
+                },
+            );
+        }
 
         if pump.actual_size < MIN_MEDIA_BYTES {
             upload.abort();
             let _ = upload.await;
+            if let Some(observation) = &file_observation {
+                observation.cancel();
+            }
             if !keep {
-                let _ = tokio::fs::remove_file(&path).await;
+                if let Some(workbench) = &workbench {
+                    workbench.settled().await;
+                }
+                let retention = Retention::without_delay(ctx.pool().clone());
+                let _ = retention::remove(&retention, &[&path]).await;
             }
             return Ok(());
         }
@@ -393,6 +515,7 @@ async fn record_segments(
             file: SegmentFile { path, keep },
             pump,
             upload,
+            observation: file_observation,
         });
         next_seq += 1;
         recorded_segments += 1;
@@ -459,7 +582,7 @@ async fn finish_pending(
                 if uploaded.uploaded_size() == uploaded.declared_size()
                     && uploaded.uploaded_size() == work.pump.actual_size =>
             {
-                match complete_byte_stream(uploaded).await {
+                match complete_byte_stream(uploaded, work.observation.as_ref()).await {
                     Ok(video) => Some(video),
                     Err(error) => {
                         warn!(seq = work.seq, ?error, "UPOS complete 失败，按临时文件重传");
@@ -468,6 +591,9 @@ async fn finish_pending(
                 }
             }
             Ok(Ok(uploaded)) => {
+                if let Some(observation) = &work.observation {
+                    observation.finish(Some("边录边传长度不一致，改用完整文件重传"));
+                }
                 warn!(
                     seq = work.seq,
                     uploaded_size = uploaded.uploaded_size(),
@@ -477,10 +603,16 @@ async fn finish_pending(
                 None
             }
             Ok(Err(error)) => {
+                if let Some(observation) = &work.observation {
+                    observation.finish(Some(&format!("{error:#}")));
+                }
                 warn!(seq = work.seq, ?error, "UPOS 预传失败，按临时文件重传");
                 None
             }
             Err(error) => {
+                if let Some(observation) = &work.observation {
+                    observation.finish(Some(&format!("{error:#}")));
+                }
                 warn!(seq = work.seq, ?error, "UPOS 预传任务失败，按临时文件重传");
                 None
             }
@@ -488,6 +620,9 @@ async fn finish_pending(
     } else {
         if let Ok(Err(error)) = uploaded {
             warn!(seq = work.seq, ?error, "短流预传未完成，按实际长度重传");
+        }
+        if let Some(observation) = &work.observation {
+            observation.finish(Some("直播结束前流式上传未完成，改用完整文件重传"));
         }
         None
     };
@@ -547,7 +682,7 @@ async fn commit_unconfirmed(
     submit_api: Option<&str>,
     recorder: &Recorder,
 ) -> AppResult<()> {
-    let (temporary_files, committed) = {
+    let (temporary_files, committed, retention) = {
         let mut state = session.lock().await;
         if state.confirmed_parts == state.videos.len() {
             return Ok(());
@@ -601,11 +736,19 @@ async fn commit_unconfirmed(
             }
             state.cleaned_parts += 1;
         }
-        (temporary_files, state.confirmed_parts)
+        (
+            temporary_files,
+            state.confirmed_parts,
+            state.retention.clone(),
+        )
     };
 
     for path in temporary_files {
-        if let Err(error) = tokio::fs::remove_file(&path).await {
+        let removed = match &retention {
+            Some(retention) => retention::remove(retention, &[&path]).await.map(|_| ()),
+            None => tokio::fs::remove_file(&path).await,
+        };
+        if let Err(error) = removed {
             warn!(?path, ?error, "删除边录边传临时文件失败");
         }
     }

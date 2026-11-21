@@ -2,13 +2,14 @@
 //!
 //! 页面直接 `<img src="https://i0.hdslb.com/...">` 会带上 biliup 自己的 Referer，
 //! B 站等图片 CDN 对站外 Referer 返回 403，所以都由服务端以直播间页面地址作 Referer 去取。
-//! 封面每场直播都可能换，只在内存里短暂缓存（见 `api::live_media`）；
+//! 封面每场直播都可能换，按主播保存最近有效图片，离线和重启后仍可读取；
 //! 头像几乎不变，开播时下载一次存到 `data/avatar/`，地址变了才重新下载。
 
 use axum::http::{HeaderValue, header};
 use bytes::Bytes;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 use std::time::Duration;
@@ -21,6 +22,10 @@ const FETCH_TIMEOUT: Duration = Duration::from_secs(15);
 const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36";
 /// 头像落盘目录，与 `use_live_cover` 的 `data/cover` 并列
 const AVATAR_DIR: &str = "data/avatar";
+const ROOM_COVER_DIR: &str = "data/room-cover";
+const COVER_TTL: Duration = Duration::from_secs(300);
+static THUMBNAIL_SLOTS: LazyLock<std::sync::Arc<tokio::sync::Semaphore>> =
+    LazyLock::new(|| std::sync::Arc::new(tokio::sync::Semaphore::new(2)));
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LiveImage {
@@ -40,8 +45,8 @@ impl LiveImage {
     /// 卡片上的封面按 16:9 缩略图显示，头像只有 22px，用不到原图。
     fn bfs_size_suffix(self) -> &'static str {
         match self {
-            LiveImage::Cover => "@640w_360h_1c.jpg",
-            LiveImage::Avatar => "@128w_128h_1c.jpg",
+            LiveImage::Cover => "@480w_270h_1c.jpg",
+            LiveImage::Avatar => "@64w_64h_1c.jpg",
         }
     }
 }
@@ -78,6 +83,40 @@ pub struct FetchedImage {
     pub body: Bytes,
 }
 
+fn thumbnail(image: FetchedImage, kind: LiveImage) -> FetchedImage {
+    let converted = (|| -> Result<Vec<u8>, image::ImageError> {
+        let mut reader = image::ImageReader::new(Cursor::new(&image.body)).with_guessed_format()?;
+        let mut limits = image::Limits::default();
+        limits.max_alloc = Some(64 * 1024 * 1024);
+        limits.max_image_width = Some(16_384);
+        limits.max_image_height = Some(16_384);
+        reader.limits(limits);
+        let decoded = reader.decode()?;
+        let (width, height) = match kind {
+            LiveImage::Cover => (480, 270),
+            LiveImage::Avatar => (64, 64),
+        };
+        let resized = if decoded.width() > width || decoded.height() > height {
+            decoded.thumbnail(width, height).to_rgb8()
+        } else {
+            decoded.to_rgb8()
+        };
+        let mut output = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut output, 70)
+            .encode_image(&resized)?;
+        Ok(output)
+    })();
+    match converted {
+        Ok(bytes) => FetchedImage {
+            content_type: "image/jpeg".into(),
+            body: Bytes::from(bytes),
+        },
+        // Some platform formats (notably AVIF without a native decoder) are already compact.
+        // Retain compatibility and cache this result instead of retrying conversion on every poll.
+        Err(_) => image,
+    }
+}
+
 /// 带 Referer 拉一张图。非 2xx、超过大小上限、上游不是图片都算失败。
 pub async fn fetch_image(
     client: &Client,
@@ -88,7 +127,7 @@ pub async fn fetch_image(
     if let Ok(referer) = HeaderValue::from_str(referer) {
         request = request.header(header::REFERER, referer);
     }
-    let response = request.send().await.map_err(|e| e.to_string())?;
+    let mut response = request.send().await.map_err(|e| e.to_string())?;
     let status = response.status();
     if !status.is_success() {
         return Err(format!("上游返回 {status}"));
@@ -104,13 +143,19 @@ pub async fn fetch_image(
         .get(header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
         .map(|value| value.to_string());
-    let body = response.bytes().await.map_err(|e| e.to_string())?;
-    if body.len() > MAX_IMAGE_BYTES {
-        return Err(format!("图片超过 {MAX_IMAGE_BYTES} 字节"));
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(|e| e.to_string())? {
+        if body.len() + chunk.len() > MAX_IMAGE_BYTES {
+            return Err(format!("图片超过 {MAX_IMAGE_BYTES} 字节"));
+        }
+        body.extend_from_slice(&chunk);
     }
     let content_type = image_content_type(upstream_type.as_deref(), &body)
         .ok_or_else(|| "上游返回的不是图片".to_string())?;
-    Ok(FetchedImage { content_type, body })
+    Ok(FetchedImage {
+        content_type,
+        body: Bytes::from(body),
+    })
 }
 
 /// 上游标了 `image/*` 就用上游的；否则按文件头识别常见格式，都认不出就拒绝。
@@ -167,8 +212,10 @@ pub struct StoredAvatar {
 pub struct AvatarStore {
     dir: PathBuf,
     client: Client,
-    /// 同一时刻只让一个下载在写盘，避免开播时的预下载和页面首次请求撞车
-    write_lock: Mutex<()>,
+    /// Same-room writes stay serialized; unrelated rooms share four bounded download lanes.
+    write_locks: [Mutex<()>; 4],
+    kind: LiveImage,
+    thumbnail_locks: [Mutex<()>; 4],
 }
 
 /// 进程内共用的头像存储，录制流程与 Web 接口都用它。
@@ -177,12 +224,24 @@ pub fn avatar_store() -> &'static AvatarStore {
     &STORE
 }
 
+/// 封面与头像共用落盘协议，但封面同一 URL 也定期刷新（部分 CDN 地址不随开播变化）。
+pub fn cover_store() -> &'static AvatarStore {
+    static STORE: LazyLock<AvatarStore> = LazyLock::new(|| {
+        let mut store = AvatarStore::new(ROOM_COVER_DIR);
+        store.kind = LiveImage::Cover;
+        store
+    });
+    &STORE
+}
+
 impl AvatarStore {
     pub fn new(dir: impl Into<PathBuf>) -> Self {
         Self {
             dir: dir.into(),
             client: image_client(),
-            write_lock: Mutex::new(()),
+            write_locks: std::array::from_fn(|_| Mutex::new(())),
+            kind: LiveImage::Avatar,
+            thumbnail_locks: std::array::from_fn(|_| Mutex::new(())),
         }
     }
 
@@ -205,6 +264,21 @@ impl AvatarStore {
         self.dir.join(&stored.file)
     }
 
+    async fn is_current(&self, id: i64, stored: &StoredAvatar, url: &str) -> bool {
+        if stored.url != url {
+            return false;
+        }
+        if self.kind == LiveImage::Avatar {
+            return true;
+        }
+        tokio::fs::metadata(self.meta_path(id))
+            .await
+            .ok()
+            .and_then(|meta| meta.modified().ok())
+            .and_then(|modified| modified.elapsed().ok())
+            .is_some_and(|elapsed| elapsed < COVER_TTL)
+    }
+
     /// 确保本地有 `url` 对应的头像：已存且地址相同就直接用；否则带 Referer 下载后写盘。
     /// 下载失败时返回错误，磁盘上的旧文件原样保留。
     pub async fn ensure(&self, id: i64, url: &str, referer: &str) -> Result<StoredAvatar, String> {
@@ -212,19 +286,18 @@ impl AvatarStore {
             return Err("头像地址不是 http(s)".to_string());
         }
         if let Some(stored) = self.load(id).await
-            && stored.url == url
+            && self.is_current(id, &stored, url).await
         {
             return Ok(stored);
         }
-        let _guard = self.write_lock.lock().await;
+        let _guard = self.write_locks[id.rem_euclid(4) as usize].lock().await;
         // 拿到锁后再看一次，前一个持锁者可能刚刚下完同一张
         if let Some(stored) = self.load(id).await
-            && stored.url == url
+            && self.is_current(id, &stored, url).await
         {
             return Ok(stored);
         }
-        let image =
-            fetch_image(&self.client, &upstream_url(url, LiveImage::Avatar), referer).await?;
+        let image = fetch_image(&self.client, &upstream_url(url, self.kind), referer).await?;
         let stored = StoredAvatar {
             url: url.to_string(),
             content_type: image.content_type.clone(),
@@ -233,14 +306,68 @@ impl AvatarStore {
         let previous = self.load(id).await;
         self.write(id, &stored, &image.body)
             .await
-            .map_err(|e| format!("写入头像失败: {e}"))?;
+            .map_err(|e| format!("写入{}失败: {e}", self.kind.label()))?;
         if let Some(previous) = previous
             && previous.file != stored.file
         {
             let _ = tokio::fs::remove_file(self.dir.join(previous.file)).await;
         }
-        info!(id, url, file = %self.image_path(&stored).display(), "主播头像已保存到本地");
+        info!(id, kind = self.kind.label(), file = %self.image_path(&stored).display(), "直播间图片已保存到本地");
         Ok(stored)
+    }
+
+    /// Lazily migrate existing caches too. Decode once per source revision, off the async
+    /// runtime, with a shared two-job budget; subsequent requests only read the small file.
+    pub async fn read_thumbnail(
+        &self,
+        id: i64,
+        stored: &StoredAvatar,
+    ) -> Result<FetchedImage, String> {
+        let _guard = self.thumbnail_locks[id.rem_euclid(4) as usize].lock().await;
+        let source = self.image_path(stored);
+        let output = self.dir.join(format!("{id}.thumb-v1"));
+        let metadata = self.dir.join(format!("{id}.thumb-v1.json"));
+        let stat = tokio::fs::metadata(&source)
+            .await
+            .map_err(|e| e.to_string())?;
+        let fingerprint = format!("{}:{}:{:?}", stored.file, stat.len(), stat.modified().ok());
+        if let Ok(bytes) = tokio::fs::read(&metadata).await
+            && let Ok((saved, content_type)) = serde_json::from_slice::<(String, String)>(&bytes)
+            && saved == fingerprint
+            && let Ok(bytes) = tokio::fs::read(&output).await
+        {
+            return Ok(FetchedImage {
+                content_type,
+                body: Bytes::from(bytes),
+            });
+        }
+        let permit = THUMBNAIL_SLOTS
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|e| e.to_string())?;
+        let body = tokio::fs::read(&source).await.map_err(|e| e.to_string())?;
+        let image = FetchedImage {
+            body: Bytes::from(body),
+            content_type: stored.content_type.clone(),
+        };
+        let kind = self.kind;
+        let image = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            thumbnail(image, kind)
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+        write_atomically(&output, &image.body)
+            .await
+            .map_err(|e| e.to_string())?;
+        write_atomically(
+            &metadata,
+            &serde_json::to_vec(&(fingerprint, &image.content_type)).map_err(|e| e.to_string())?,
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+        Ok(image)
     }
 
     /// 先写临时文件再改名，避免页面读到半张图或半份 json
@@ -278,6 +405,15 @@ pub fn spawn_avatar_download(id: i64, url: Option<String>, referer: String) {
     });
 }
 
+pub fn spawn_cover_download(id: i64, url: Option<String>, referer: String) {
+    let Some(url) = url else { return };
+    tokio::spawn(async move {
+        if let Err(reason) = cover_store().ensure(id, &url, &referer).await {
+            warn!(id, reason, "下载直播间封面失败，保留最近有效封面");
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -292,11 +428,11 @@ mod tests {
                 "https://i0.hdslb.com/bfs/live/user_cover/abc.jpg",
                 LiveImage::Cover
             ),
-            "https://i0.hdslb.com/bfs/live/user_cover/abc.jpg@640w_360h_1c.jpg"
+            "https://i0.hdslb.com/bfs/live/user_cover/abc.jpg@480w_270h_1c.jpg"
         );
         assert_eq!(
             upstream_url("https://i1.hdslb.com/bfs/face/def.jpg", LiveImage::Avatar),
-            "https://i1.hdslb.com/bfs/face/def.jpg@128w_128h_1c.jpg"
+            "https://i1.hdslb.com/bfs/face/def.jpg@64w_64h_1c.jpg"
         );
         // 已带缩放参数的不重复追加
         assert_eq!(
@@ -338,6 +474,83 @@ mod tests {
             Some("image/avif")
         );
         assert_eq!(image_content_type(Some("text/html"), b"<html>"), None);
+    }
+
+    #[tokio::test]
+    async fn old_full_size_caches_get_small_reusable_thumbnails_without_an_upstream_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = AvatarStore::new(dir.path());
+        store.kind = LiveImage::Cover;
+        let input = image::RgbImage::from_fn(1920, 1080, |x, y| {
+            image::Rgb([(x % 256) as u8, (y % 256) as u8, ((x + y) % 256) as u8])
+        });
+        let mut body = Cursor::new(Vec::new());
+        input.write_to(&mut body, image::ImageFormat::Png).unwrap();
+        let original = body.into_inner();
+        let stored = StoredAvatar {
+            url: "https://offline.invalid/cover.png".into(),
+            content_type: "image/png".into(),
+            file: "5.png".into(),
+        };
+        store.write(5, &stored, &original).await.unwrap();
+        let first = store.read_thumbnail(5, &stored).await.unwrap();
+        let decoded = image::load_from_memory(&first.body).unwrap();
+        assert_eq!((decoded.width(), decoded.height()), (480, 270));
+        assert_eq!(first.content_type, "image/jpeg");
+        assert!(first.body.len() < original.len() / 4);
+        let thumb_path = dir.path().join("5.thumb-v1");
+        let written = std::fs::metadata(&thumb_path).unwrap().modified().unwrap();
+        let repeated = store.read_thumbnail(5, &stored).await.unwrap();
+        assert_eq!(repeated.body, first.body);
+        assert_eq!(
+            std::fs::metadata(&thumb_path).unwrap().modified().unwrap(),
+            written,
+            "cached thumbnails must not be re-encoded"
+        );
+        // Replacing a source invalidates its thumbnail, even when its URL stays the same.
+        image::RgbImage::from_pixel(32, 18, image::Rgb([255, 0, 0]))
+            .save(store.image_path(&stored))
+            .unwrap();
+        let updated = store.read_thumbnail(5, &stored).await.unwrap();
+        let decoded = image::load_from_memory(&updated.body).unwrap();
+        assert_eq!(
+            (decoded.width(), decoded.height()),
+            (32, 18),
+            "small sources are not enlarged"
+        );
+        assert_ne!(updated.body, first.body);
+        eprintln!(
+            "1920x1080 PNG {} bytes -> 480x270 JPEG {} bytes",
+            original.len(),
+            first.body.len()
+        );
+    }
+
+    #[test]
+    fn avatar_thumbnails_are_bounded_and_unsupported_formats_remain_usable() {
+        let mut bytes = Cursor::new(Vec::new());
+        image::RgbImage::new(256, 256)
+            .write_to(&mut bytes, image::ImageFormat::Png)
+            .unwrap();
+        let output = thumbnail(
+            FetchedImage {
+                body: Bytes::from(bytes.into_inner()),
+                content_type: "image/png".into(),
+            },
+            LiveImage::Avatar,
+        );
+        let decoded = image::load_from_memory(&output.body).unwrap();
+        assert_eq!((decoded.width(), decoded.height()), (64, 64));
+        let svg = Bytes::from_static(b"<svg xmlns='http://www.w3.org/2000/svg'/>");
+        let output = thumbnail(
+            FetchedImage {
+                body: svg.clone(),
+                content_type: "image/svg+xml".into(),
+            },
+            LiveImage::Cover,
+        );
+        assert_eq!(output.body, svg);
+        assert_eq!(output.content_type, "image/svg+xml");
     }
 
     /// (请求路径, Referer) 记录
@@ -473,6 +686,57 @@ mod tests {
                 .ensure(3, "data:image/png;base64,AAAA", "x")
                 .await
                 .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn covers_refresh_unchanged_urls_after_ttl_and_keep_valid_files_on_failure() {
+        let (base, seen) = image_server().await;
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = AvatarStore::new(dir.path());
+        store.kind = LiveImage::Cover;
+        let url = format!("{base}/a.jpg");
+        let first = store
+            .ensure(4, &url, "https://example.com/room")
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .ensure(4, &url, "https://example.com/room")
+                .await
+                .unwrap(),
+            first
+        );
+        assert_eq!(seen.lock().unwrap().len(), 1);
+        let old = std::time::SystemTime::now() - COVER_TTL - Duration::from_secs(1);
+        std::fs::File::options()
+            .write(true)
+            .open(store.meta_path(4))
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(old))
+            .unwrap();
+        assert!(
+            store
+                .ensure(4, &url, "https://example.com/room")
+                .await
+                .is_ok()
+        );
+        assert_eq!(
+            seen.lock().unwrap().len(),
+            2,
+            "same CDN URL must be refreshed after TTL"
+        );
+        assert!(
+            store
+                .ensure(4, &format!("{base}/broken"), "https://example.com/room")
+                .await
+                .is_err()
+        );
+        assert_eq!(store.load(4).await, Some(first));
+        let reopened = AvatarStore::new(dir.path());
+        assert!(
+            reopened.load(4).await.is_some(),
+            "offline file survives a restart"
         );
     }
 }

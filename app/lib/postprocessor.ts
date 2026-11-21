@@ -1,8 +1,9 @@
 /**
- * 后处理步骤的双向转换:表单形态 {cmd, value} ↔ 后端 HookStep 形态。
+ * 后处理步骤的双向转换：表单形态 {cmd, value} 与后端 HookStep 形态。
  *
  * 后端 HookStep 是 #[serde(untagged)] 枚举(声明顺序即匹配顺序):
- *   Run { run: string } | Move { mv: string } | Remux { remux: string } | Remove("rm")
+ *   Run { run: string } | Move { mv: string } | Webhook { webhook: string }
+ *   | Remux { remux: string } | Render { render: object } | Remove("rm")
  * 表单(ArrayField)中每个步骤的字段是 cmd(Select) + value(Input)。
  *
  * 严禁把 {mv: target} 改写成 {run: "mv target"} —— untagged 枚举先匹配 Run,
@@ -13,6 +14,7 @@
 export interface PostprocessorFormStep {
   cmd?: string
   value?: string
+  json?: boolean
 }
 
 /** 后端 HookStep → 表单 {cmd, value}(回显 / 编辑用) */
@@ -25,12 +27,15 @@ export function hookStepToForm(step: unknown): PostprocessorFormStep {
     const s = step as Record<string, unknown>
     // 已是表单形态
     if (typeof s.cmd === 'string') {
-      return { cmd: s.cmd, value: typeof s.value === 'string' ? s.value : undefined }
+      return { cmd: s.cmd, value: typeof s.value === 'string' ? s.value : undefined, ...(s.json === true ? { json: true } : {}) }
+    }
+    if (typeof s.run === 'string') {
+      return { cmd: 'run', value: s.run, ...(s.json === true ? { json: true } : {}) }
     }
     // {run}/{mv}/{remux} 等单键对象 → cmd/key, value/value
     const keys = Object.keys(s).filter(k => s[k] !== undefined && s[k] !== null && s[k] !== '')
     if (keys.length > 0) {
-      return { cmd: keys[0], value: String(s[keys[0]]) }
+      return { cmd: keys[0], value: keys[0] === 'render' ? JSON.stringify(s.render, null, 2) : String(s[keys[0]]) }
     }
   }
   return { cmd: 'run', value: '' }
@@ -45,14 +50,22 @@ export function formToHookStep(step: PostprocessorFormStep): unknown {
       // Remove("rm")
       return 'rm'
     case 'run':
-      return { run: value }
+      return { run: value, ...(step.json === true ? { json: true } : {}) }
     case 'mv':
       return { mv: value }
     case 'remux':
       return { remux: value }
+    case 'webhook':
+      return { webhook: value }
+    case 'render': {
+      const render: unknown = JSON.parse(value)
+      if (!render || typeof render !== 'object' || Array.isArray(render)) {
+        throw new Error('画面与弹幕设置必须是 JSON 对象')
+      }
+      return { render }
+    }
     default:
-      // webhook 等后端暂不支持的形态:原样返回,不静默丢弃
-      return step
+      throw new Error(`不支持的后处理操作: ${String(cmd ?? '')}`)
   }
 }
 

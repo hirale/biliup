@@ -1,34 +1,50 @@
 'use client'
 import React from 'react'
 import { DashboardEvent } from '@/app/lib/use-dashboard'
+import Link from 'next/link'
+import { recordingEditorHref } from '@/app/lib/workbench'
 import styles from './event-timeline.module.scss'
 
-function fmtTime(ts: number): string {
-  const d = new Date(ts * 1000)
-  const pad = (n: number) => String(n).padStart(2, '0')
-  return `${pad(d.getHours())}:${pad(d.getMinutes())}`
-}
+const dateFormat = new Intl.DateTimeFormat('zh-CN', { year: 'numeric', month: '2-digit', day: '2-digit' })
+const timeFormat = new Intl.DateTimeFormat('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false })
 
-/**
- * 最近事件时间线:前端由 /v1/streamer-info(开始录制)与 /v1/videos(文件生成)
- * 合成,零后端改动。
- */
-export default function EventTimeline({ events }: { events: DashboardEvent[] }) {
+export default function EventTimeline({ events, error = false }: { events: DashboardEvent[]; error?: boolean }) {
+  if (error) return <div className={styles.empty}>事件记录暂时无法加载，概览其它数据仍可正常使用。</div>
   if (events.length === 0) {
     return (
       <div className={styles.empty}>
-        最近 24h 没有录制活动
+        暂无事件记录
       </div>
     )
   }
+  const groups = new Map<string, DashboardEvent[]>()
+  for (const event of events) {
+    const date = new Date(event.ts)
+    const day = Number.isFinite(date.getTime()) ? dateFormat.format(date) : '日期未知'
+    const group = groups.get(day) ?? []
+    group.push(event)
+    groups.set(day, group)
+  }
   return (
-    <div className={styles.timeline}>
-      {events.map((e, idx) => (
-        <div key={`${e.kind}-${e.ts}-${idx}`} className={`${styles.item} ${styles[e.kind]}`}>
-          <span className={styles.time}>{fmtTime(e.ts)}</span>
-          <span className={styles.text}>{e.text}</span>
-          {e.sub ? <span className={styles.tag}>{e.sub}</span> : null}
-        </div>
+    <div className={styles.groups}>
+      {[...groups].map(([day, items]) => (
+        <section key={day} aria-label={day}>
+          <h3 className={styles.date}>{day}</h3>
+          <ol className={styles.timeline}>
+            {items.map(e => (
+              <li key={e.id} className={`${styles.item} ${e.kind.includes('start') ? styles.start : e.kind.includes('file') ? styles.file : ''}`}>
+                <div className={styles.meta}>
+                  <time className={styles.time} dateTime={Number.isFinite(new Date(e.ts).getTime()) ? new Date(e.ts).toISOString() : undefined}>
+                    {Number.isFinite(new Date(e.ts).getTime()) ? timeFormat.format(new Date(e.ts)) : '时间未知'}
+                  </time>
+                  {e.session_id != null ? <Link className={styles.link} href={recordingEditorHref(e.session_id)} prefetch={false}>打开场次</Link> : null}
+                </div>
+                <div className={styles.text}>{e.text}</div>
+                {e.sub ? <div className={styles.tag}>{e.sub}</div> : null}
+              </li>
+            ))}
+          </ol>
+        </section>
       ))}
     </div>
   )

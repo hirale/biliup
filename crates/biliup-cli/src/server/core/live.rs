@@ -84,6 +84,8 @@ fn live_options(config: &Config) -> LiveOptions {
                 .unwrap_or_else(|| "hw-h5".to_string()),
             force_hs: config.douyu_force_hs.unwrap_or(false),
             rate: config.douyu_rate.unwrap_or(0),
+            device_id: config.douyu_device_id.clone().unwrap_or_default(),
+            codec: config.douyu_codec.clone().unwrap_or_default(),
             disable_interactive_game: config.douyu_disable_interactive_game.unwrap_or(false),
             danmaku: config.douyu_danmaku.unwrap_or(false),
         },
@@ -139,13 +141,22 @@ fn live_options(config: &Config) -> LiveOptions {
 }
 
 fn live_credentials(config: &Config) -> LiveCredentials {
+    // 斗鱼 Cookie 是顶层配置（可按主播覆写），不在 `user` 里，没有 `user` 段时也要带上
+    let douyu_cookie = config
+        .douyu_cookie
+        .clone()
+        .filter(|cookie| !cookie.trim().is_empty());
     let Some(user) = &config.user else {
-        return LiveCredentials::default();
+        return LiveCredentials {
+            douyu_cookie,
+            ..LiveCredentials::default()
+        };
     };
     LiveCredentials {
         bilibili_cookie: user.bili_cookie.clone(),
         bilibili_cookie_file: user.bili_cookie_file.clone(),
         douyin_cookie: user.douyin_cookie.clone(),
+        douyu_cookie,
         twitcasting_cookie: user.twitcasting_cookie.clone(),
         twitch_cookie: user.twitch_cookie.clone(),
         youtube_cookie: user.youtube_cookie.clone(),
@@ -171,8 +182,18 @@ pub fn streamer_info(stream: &LiveStream) -> StreamerInfo {
 pub fn downloader_runtime(
     config_type: Option<DownloaderType>,
     stream: &LiveStream,
+    output_format: Option<&str>,
 ) -> DownloaderRuntime {
-    let downloader_type = config_type.unwrap_or_else(|| match stream.downloader_hint {
+    // mesio 与 stream-gears 都不转封装，只把扩展名改成 .mp4 会得到没有可用视频流的文件
+    let wants_mp4 = output_format.is_some_and(|format| {
+        format
+            .trim()
+            .trim_start_matches('.')
+            .eq_ignore_ascii_case("mp4")
+    });
+    let downloader_type = config_type.unwrap_or(match stream.downloader_hint {
+        // 要求 MP4 输出时改用 ffmpeg 真正转封装
+        DownloaderHint::StreamGears if wants_mp4 => DownloaderType::Ffmpeg,
         // 未配置下载器时用 mesio：写出的 FLV 带 onMetaData.keyframes、每段时间戳从 0 开始，
         // 能录 HEVC / Enhanced-FLV 与 HLS fMP4。显式配置 stream-gears 的不受影响
         DownloaderHint::StreamGears => DownloaderType::Mesio,
@@ -181,6 +202,8 @@ pub fn downloader_runtime(
         DownloaderHint::YtDlp => DownloaderType::YtDlp,
     });
 
+    // Explicit native downloaders keep their selection and report their actual
+    // container. Only automatic selection may choose ffmpeg for MP4 output.
     match downloader_type {
         DownloaderType::Streamlink => streamlink_runtime(stream),
         // Twitch 指定 ffmpeg 时也走 streamlink：Python 版 ffmpeg 消费的是
@@ -259,7 +282,7 @@ fn ytdlp_runtime(stream: &LiveStream, downloader_type: DownloaderType) -> Downlo
             ..Default::default()
         },
     };
-    DownloaderRuntime::YtDlp(YtDlpDownloader::new(cfg))
+    DownloaderRuntime::YtDlp(Box::new(YtDlpDownloader::new(cfg)))
 }
 
 fn ytdlp_config(options: &YtDlpOptions, downloader_type: DownloaderType) -> YtDlpConfig {
@@ -351,7 +374,9 @@ mod tests {
 
     #[test]
     fn unconfigured_rooms_default_to_mesio() {
-        let runtime = downloader_runtime(None, &stream(DownloaderHint::StreamGears));
+        let runtime = downloader_runtime(None, &stream(DownloaderHint::StreamGears), None);
+        assert!(matches!(runtime, DownloaderRuntime::Mesio(_)));
+        let runtime = downloader_runtime(None, &stream(DownloaderHint::StreamGears), Some("flv"));
         assert!(matches!(runtime, DownloaderRuntime::Mesio(_)));
     }
 
@@ -360,15 +385,94 @@ mod tests {
         let runtime = downloader_runtime(
             Some(DownloaderType::StreamGears),
             &stream(DownloaderHint::StreamGears),
+            None,
         );
         assert!(matches!(runtime, DownloaderRuntime::StreamGears(_)));
     }
 
     #[test]
-    fn plugin_hints_for_external_tools_are_unchanged() {
-        let runtime = downloader_runtime(None, &stream(DownloaderHint::Streamlink));
-        assert!(matches!(runtime, DownloaderRuntime::StreamLink(_)));
-        let runtime = downloader_runtime(None, &stream(DownloaderHint::Ffmpeg));
+    fn automatic_mp4_uses_ffmpeg_but_explicit_downloaders_keep_native_containers() {
+        let runtime = downloader_runtime(None, &stream(DownloaderHint::StreamGears), Some("mp4"));
         assert!(matches!(runtime, DownloaderRuntime::Ffmpeg(_)));
+        let runtime = downloader_runtime(
+            Some(DownloaderType::StreamGears),
+            &stream(DownloaderHint::StreamGears),
+            Some(".MP4"),
+        );
+        assert!(matches!(runtime, DownloaderRuntime::StreamGears(_)));
+        // 边录边传与显式 mesio 保持用户的选择
+        let runtime = downloader_runtime(
+            Some(DownloaderType::SyncDownloader),
+            &stream(DownloaderHint::StreamGears),
+            Some("mp4"),
+        );
+        assert!(matches!(runtime, DownloaderRuntime::Sync(_)));
+        let runtime = downloader_runtime(
+            Some(DownloaderType::Mesio),
+            &stream(DownloaderHint::StreamGears),
+            Some("mp4"),
+        );
+        assert!(matches!(runtime, DownloaderRuntime::Mesio(_)));
+    }
+
+    #[test]
+    fn plugin_hints_for_external_tools_are_unchanged() {
+        let runtime = downloader_runtime(None, &stream(DownloaderHint::Streamlink), Some("mp4"));
+        assert!(matches!(runtime, DownloaderRuntime::StreamLink(_)));
+        let runtime = downloader_runtime(None, &stream(DownloaderHint::Ffmpeg), None);
+        assert!(matches!(runtime, DownloaderRuntime::Ffmpeg(_)));
+    }
+
+    #[test]
+    fn room_ffmpeg_args_reach_every_ffmpeg_runtime() {
+        // #1559：房间的「ffmpeg参数」（opt_args）要追加到 ffmpeg 命令行里，
+        // 显式选 ffmpeg、插件默认 ffmpeg、要求 MP4 时改用 ffmpeg 都一样
+        let args = vec!["-metadata".to_string(), "comment=opt-args".to_string()];
+        for (config_type, hint, format) in [
+            (
+                Some(DownloaderType::Ffmpeg),
+                DownloaderHint::StreamGears,
+                None,
+            ),
+            (
+                Some(DownloaderType::FfmpegExternal),
+                DownloaderHint::StreamGears,
+                None,
+            ),
+            (
+                Some(DownloaderType::FfmpegInternal),
+                DownloaderHint::StreamGears,
+                None,
+            ),
+            (None, DownloaderHint::Ffmpeg, None),
+            (None, DownloaderHint::StreamGears, Some("mp4")),
+        ] {
+            let runtime = downloader_runtime(config_type, &stream(hint), format)
+                .with_ffmpeg_args(args.clone());
+            let DownloaderRuntime::Ffmpeg(ffmpeg) = runtime else {
+                panic!("{config_type:?} 应构造 ffmpeg 下载器");
+            };
+            assert_eq!(ffmpeg.extra_args, args, "{config_type:?} {format:?}");
+        }
+    }
+
+    #[test]
+    fn room_ffmpeg_args_do_not_change_other_downloaders() {
+        let args = vec!["-ss".to_string(), "00:00:16".to_string()];
+        let runtime = downloader_runtime(None, &stream(DownloaderHint::StreamGears), None)
+            .with_ffmpeg_args(args.clone());
+        assert!(matches!(runtime, DownloaderRuntime::Mesio(_)));
+        // Twitch 指定 ffmpeg 实际走 streamlink，没有 ffmpeg 命令行可加
+        let mut twitch = stream(DownloaderHint::Ffmpeg);
+        twitch.runtime_options = Some(RuntimeOptions::Streamlink(StreamlinkOptions {
+            url: None,
+            platform: StreamlinkPlatform::Twitch {
+                disable_ads: true,
+                auth_token: None,
+            },
+        }));
+        let runtime =
+            downloader_runtime(Some(DownloaderType::Ffmpeg), &twitch, None).with_ffmpeg_args(args);
+        assert!(matches!(runtime, DownloaderRuntime::StreamLink(_)));
     }
 }

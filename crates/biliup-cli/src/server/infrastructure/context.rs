@@ -1,5 +1,6 @@
 use crate::server::common::download::DownloadTask;
 use crate::server::common::recording_policy::Rejection;
+use crate::server::common::upload_observation::UploadObservations;
 use crate::server::common::util::Recorder;
 use crate::server::config::Config;
 use crate::server::core::downloader::DownloadConfig;
@@ -8,17 +9,19 @@ use crate::server::infrastructure::connection_pool::ConnectionPool;
 use crate::server::infrastructure::models::StreamerInfo;
 use crate::server::infrastructure::models::live_streamer::LiveStreamer;
 use crate::server::infrastructure::models::upload_streamer::UploadStreamer;
+use crate::server::services::douyu_keeper::{DouyuCookieKeeper, apply_douyu_override};
 use biliup::client::StatelessClient;
 use biliup::downloader::live::LiveStream;
 use core::fmt;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
-use struct_patch::Patch;
+use tokio::sync::watch;
 use tracing::{error, info};
 
 /// 应用程序上下文，包含工作器和扩展信息
 #[derive(Debug, Clone)]
 pub struct Context {
+    pub(crate) download_end: Arc<crate::server::common::downloaded::SessionEnd>,
     id: i64,
     /// 工作器实例
     worker: Arc<Worker>,
@@ -36,6 +39,7 @@ impl Context {
         let mut streamer_info = streamer_info(&stream);
         streamer_info.id = id;
         Self {
+            download_end: Arc::default(),
             id,
             worker,
             stream,
@@ -57,7 +61,7 @@ impl Context {
     }
 
     pub fn live_streamer(&self) -> &LiveStreamer {
-        &self.worker.get_streamer()
+        self.worker.get_streamer()
     }
 
     pub fn stateless_client(&self) -> &StatelessClient {
@@ -70,6 +74,10 @@ impl Context {
 
     pub fn pool(&self) -> &ConnectionPool {
         &self.pool
+    }
+
+    pub(crate) fn upload_observations(&self) -> Option<&Arc<UploadObservations>> {
+        self.worker.upload_observations.as_ref()
     }
 
     pub async fn change_status(&self, stage: Stage, status: WorkerStatus) {
@@ -128,9 +136,10 @@ impl Context {
             recorder: self.recorder(stream_info),
             // output_dir: PathBuf::from("./downloads")
             output_dir: PathBuf::from("."),
-            suffix,
+            suffix: suffix.trim().trim_start_matches('.').to_ascii_lowercase(),
             bytes_written: Default::default(),
             preview: Default::default(),
+            index_tap: None,
         }
     }
 }
@@ -138,6 +147,8 @@ impl Context {
 /// 工作器结构体，管理单个主播的录制和上传任务
 #[derive(Debug)]
 pub struct Worker {
+    /// 串行处理同一房间的暂停/恢复，保持持久化状态与运行状态一致。
+    pub(crate) recording_control: tokio::sync::Mutex<()>,
     /// 下载器状态
     pub downloader_status: RwLock<WorkerStatus>,
     /// 上传器状态
@@ -148,6 +159,8 @@ pub struct Worker {
     pub upload_streamer: Option<UploadStreamer>,
     /// 全局配置
     config: Arc<RwLock<Config>>,
+    douyu_keeper: Option<Arc<DouyuCookieKeeper>>,
+    upload_observations: Option<Arc<UploadObservations>>,
     /// HTTP客户端
     pub client: StatelessClient,
     /// 最近一次开播探测被录制策略挡下的原因，仅用于向界面解释「为什么没在录」。
@@ -155,6 +168,8 @@ pub struct Worker {
     /// 不参与任何控制流。只存需要流信息才能判定的结论（如标题命中排除关键词）；
     /// 探测前就能判定的条件（如录制时间范围）由接口侧按当前时钟实时算，不会过期。
     last_rejection: RwLock<Option<Rejection>>,
+    /// 暂停或替换工作器时取消正在进行的开播检测。
+    monitor_changes: watch::Sender<()>,
 }
 
 impl Worker {
@@ -172,18 +187,32 @@ impl Worker {
         client: StatelessClient,
     ) -> Self {
         Self {
+            recording_control: tokio::sync::Mutex::new(()),
             downloader_status: RwLock::new(Default::default()),
             uploader_status: Default::default(),
             live_streamer,
             upload_streamer,
             config,
+            douyu_keeper: None,
+            upload_observations: None,
             client,
             last_rejection: RwLock::new(None),
+            monitor_changes: watch::channel(()).0,
         }
     }
 
     pub fn id(&self) -> i64 {
         self.live_streamer.id
+    }
+
+    pub fn with_douyu_keeper(mut self, keeper: Arc<DouyuCookieKeeper>) -> Self {
+        self.douyu_keeper = Some(keeper);
+        self
+    }
+
+    pub fn with_upload_observations(mut self, observations: Arc<UploadObservations>) -> Self {
+        self.upload_observations = Some(observations);
+        self
     }
 
     /// 记录本轮开播探测的策略判定结果（`None` 表示未被挡下）。
@@ -194,6 +223,26 @@ impl Worker {
     /// 最近一次探测被挡下的原因。
     pub fn rejection(&self) -> Option<Rejection> {
         self.last_rejection.read().unwrap().clone()
+    }
+
+    pub(crate) fn monitor_changes(&self) -> watch::Receiver<()> {
+        self.monitor_changes.subscribe()
+    }
+
+    /// 与暂停/恢复共用状态锁，避免已结束的旧检测在 spawn 后覆盖暂停状态。
+    pub(crate) fn start_download(
+        &self,
+        task: Arc<DownloadTask>,
+        monitor_changes: &watch::Receiver<()>,
+    ) -> bool {
+        let mut status = self.downloader_status.write().unwrap();
+        if monitor_changes.has_changed().unwrap_or(true)
+            || !matches!(*status, WorkerStatus::Pending)
+        {
+            return false;
+        }
+        *status = WorkerStatus::Working(task);
+        true
     }
 
     /// 获取主播信息
@@ -214,7 +263,10 @@ impl Worker {
         let mut cfg = self.config.read().unwrap().clone();
 
         if let Some(cfg_p) = self.live_streamer.override_cfg.clone() {
-            cfg.apply(cfg_p)
+            apply_douyu_override(&mut cfg, &cfg_p);
+        }
+        if let Some(keeper) = &self.douyu_keeper {
+            keeper.resolve(&mut cfg);
         }
         cfg
     }
@@ -227,16 +279,21 @@ impl Worker {
     pub async fn change_status(&self, stage: Stage, status: WorkerStatus) {
         match stage {
             Stage::Download => {
-                let task = if let WorkerStatus::Working(task) =
-                    &*self.downloader_status.read().unwrap()
-                    && !matches!(status, WorkerStatus::Working(_))
-                {
-                    Some(task.clone())
-                } else {
-                    None
+                let task = {
+                    let mut current = self.downloader_status.write().unwrap();
+                    let task = if let WorkerStatus::Working(task) = &*current
+                        && !matches!(status, WorkerStatus::Working(_))
+                    {
+                        Some(task.clone())
+                    } else {
+                        None
+                    };
+                    if matches!(status, WorkerStatus::Pause | WorkerStatus::Idle) {
+                        self.monitor_changes.send_replace(());
+                    }
+                    *current = status;
+                    task
                 };
-
-                *self.downloader_status.write().unwrap() = status;
 
                 if let Some(task) = task
                     && let Err(e) = task.stop().await

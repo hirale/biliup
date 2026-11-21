@@ -2,14 +2,26 @@
 import React from 'react'
 import styles from '../../styles/dashboard.module.scss'
 import SectionTitle from '../../(app)/components/SectionTitle'
-import { Form, Select, Space, useFormState } from '@douyinfe/semi-ui'
+import { Form, Select, Space, Switch, useFormApi, useFormState } from '@douyinfe/semi-ui'
 import { IconUpload, IconDownload } from '@douyinfe/semi-icons'
 import { FileSizeField } from '../FileSizeInput'
+import { SegmentTimeField } from '../SegmentTimeField'
 
-const Global: React.FC = () => {
+/** 打开「投稿后保留录像」时默认保留的小时数 */
+const DEFAULT_RETENTION_HOURS = 24
+
+type Props = {
+  /** 只读角色：表单整体禁用，不是表单字段的开关也要跟着禁用 */
+  disabled?: boolean
+}
+
+const Global: React.FC<Props> = ({ disabled }) => {
   // useFormApi 不订阅表单值变化，切换下拉框后条件渲染不会刷新；useFormState 会
   const { values } = useFormState()
+  const formApi = useFormApi()
   const isSyncDownloader = values?.downloader === 'sync-downloader'
+  // 开关不是表单字段（整体覆盖保存时不能多出键），状态由小时数推出来：大于 0 即开
+  const retentionOn = Number(values?.retention_hours) > 0
 
   return (
     <>
@@ -56,8 +68,8 @@ const Global: React.FC = () => {
               <br />
               5. ytarchive：仅适用于 YouTube 直播。
               <br />
-              6. stream-gears：内置，无需额外安装，可防 FLV 流花屏；不支持 HEVC 编码和 hls_fmp4 流，FLV
-              时间戳沿用源站的原值（不从 0 开始）。
+              6. stream-gears：内置，无需额外安装，可防 FLV 流花屏；能录 AVC / HEVC / AV1（含 Enhanced FLV），
+              HLS 流也能录（TS 存 .ts，fMP4 存 .mp4，不支持加密流）；FLV 时间戳沿用源站的原值（不从 0 开始）。
             </div>
           }
           style={{ width: '100%' }}
@@ -131,38 +143,22 @@ const Global: React.FC = () => {
             padding: 0,
           }}
         />
-        <Form.Input
+        <SegmentTimeField
           field="segment_time"
           extraText={
             <div style={{ fontSize: '14px' }}>
               录像单文件时间限制，超过此时长触发文件分割。
               <br />
-              格式：&apos;00:00:00&apos;（时:分:秒）
+              选择预设或自定义，例如 00:07:30、7:30（7 分 30 秒）、450（秒）。不按时长分段时仍可按文件大小分段。
+              <br />
+              分段较短时请同时检查碎片过滤阈值，低于阈值的分段会被过滤。
             </div>
           }
           label="视频分段时长（segment_time）"
-          placeholder="01:00:00"
-          style={{ width: '100%' }}
           fieldStyle={{
             alignSelf: 'stretch',
             padding: 0,
           }}
-          showClear={true}
-          rules={[
-            {
-              pattern: /^[^：]*$/,
-              message: '请使用英文冒号',
-            },
-            {
-              pattern: /^[0-9:]*$/,
-              message: '只接受数字和英文冒号',
-            },
-            {
-              pattern: /^$|^[0-9]{2,4}:[0-5][0-9]:[0-5][0-9]$/,
-              message: '分或秒不符合规范',
-            },
-          ]}
-          stopValidateWithError={true}
         />
         <Form.Input
           field="filename_prefix"
@@ -213,6 +209,55 @@ const Global: React.FC = () => {
           }}
           showClear={true}
         />
+        <Form.Slot
+          label="投稿后保留录像（retention_hours）"
+          style={{ alignSelf: 'stretch', padding: 0 }}
+        >
+          <Switch
+            aria-label="投稿后保留录像"
+            checked={retentionOn}
+            disabled={disabled}
+            onChange={on => formApi.setValue('retention_hours', on ? DEFAULT_RETENTION_HOURS : 0)}
+          />
+        </Form.Slot>
+        <Form.InputNumber
+          field="retention_hours"
+          noLabel={true}
+          extraText={
+            <div style={{ fontSize: '14px' }}>
+              后处理 rm、边录边传投稿后删除临时文件时，录像先保留这么多小时，到期后由每分钟一次的清理任务删除（连同弹幕 XML
+              和 .idx 关键帧索引）。关闭或填 0 表示立即删除，与以前一样。
+              <br />
+              剪辑台里被标记、切片引用的片段，以及点了「保留这场」的场次，不论这里怎么设都会等引用释放后再删。
+            </div>
+          }
+          min={0}
+          precision={0}
+          suffix="小时"
+          placeholder="0"
+          style={{ width: '100%' }}
+          fieldStyle={{
+            alignSelf: 'stretch',
+            padding: 0,
+          }}
+        />
+        <FileSizeField
+          field="min_free_space"
+          label="磁盘最低可用空间（min_free_space）"
+          placeholder="不启用"
+          extraText={
+            <div style={{ fontSize: '14px' }}>
+              录像所在磁盘的可用空间低于这个值时，每分钟检查一次，按「没被剪辑台引用的最旧录像 → 被引用的最旧录像」
+              逐个删除，直到回到这个值以上。正在录的分段不删；只删剪辑台记录过的录像（本版本之后录制的），其它文件不碰。
+              <br />
+              <strong>会删掉还没投稿的录像</strong>，只作磁盘写满前的兜底。留空表示不启用（默认）。按 1024 进制换算。
+            </div>
+          }
+          fieldStyle={{
+            alignSelf: 'stretch',
+            padding: 0,
+          }}
+        />
 
         <Form.InputNumber
           field="delay"
@@ -255,7 +300,8 @@ const Global: React.FC = () => {
         />
         <Form.InputNumber
           field="pool1_size"
-          extraText="负责下载事件的线程池大小，用于限制最大同时录制数。"
+          extraText="负责下载事件的线程池大小，用于限制最大同时录制数。保存后立即生效（等待中的直播间在下一轮检测时开始录制），调小不会中断正在进行的录制。"
+          min={1}
           label="下载线程池大小（pool1_size）"
           placeholder={5}
           style={{ width: '100%' }}
@@ -293,6 +339,26 @@ const Global: React.FC = () => {
           <Form.Select.Option value="relay">经 biliup 中转（relay）</Form.Select.Option>
           <Form.Select.Option value="direct">浏览器直连 CDN（direct）</Form.Select.Option>
         </Form.Select>
+        <Form.InputNumber
+          field="preview_max_minutes"
+          label="单条中转预览最长时长（preview_max_minutes）"
+          extraText={
+            <div style={{ fontSize: '14px' }}>
+              一条经 biliup 中转的预览连接最多持续这么多分钟，到点断开，页面里的播放器会自动重连接着播。
+              关掉的预览平时由页面心跳在 45 秒内回收（经过代理 / 隧道访问也一样），这里是再往后的兜底。
+              留空为 30 分钟，填 0 不限。另外每个直播间最多 4 路、全部合计最多 16 路，满了再打开会接替最早的一路。
+            </div>
+          }
+          min={0}
+          placeholder={30}
+          suffix="分钟"
+          style={{ width: '100%' }}
+          fieldStyle={{
+            alignSelf: 'stretch',
+            padding: 0,
+          }}
+          showClear={true}
+        />
       </div>
 
       <Space />
@@ -304,7 +370,8 @@ const Global: React.FC = () => {
         <Form.Select
           field="submit_api"
           label="提交接口（submit_api）"
-          extraText="B站投稿提交接口，默认为自动选择。"
+          extraText="B站投稿提交接口，不选时用网页（web）。"
+          placeholder="网页（web）"
           style={{ width: '100%' }}
           fieldStyle={{
             alignSelf: 'stretch',
@@ -369,8 +436,10 @@ const Global: React.FC = () => {
         />
         <Form.InputNumber
           field="max_upload_limit"
-          placeholder={8}
-          extraText="录播上传次数上限，防止因意外情况如B站接口抽风、录播本身损坏导致录播反复上传浪费宽带或被B站风控（注：限制是记录在程序上下文中的，重启程序会重置上传次数限制；且为了保证尽量不改动老用户使用逻辑，默认将此值设置为一个较大的值，一般推荐设置为2-3）"
+          min={1}
+          precision={0}
+          placeholder={6}
+          extraText="同一分段因断网、超时等网络故障上传失败时最多上传几次（含第一次），两次之间从 30 秒起翻倍等待、最长 5 分钟，用完仍失败就跳过该分段、保留录像文件。不填为 6 次（约 12.5 分钟内网络恢复都能补传），填 1 为不重试。B 站限流、风控等拒绝不会重试"
           label="上传重试次数限制（max_upload_limit）"
           style={{ width: '100%' }}
           fieldStyle={{
@@ -382,8 +451,11 @@ const Global: React.FC = () => {
 
         <Form.InputNumber
           field="pool2_size"
+          min={1}
           extraText={
-            <div style={{ fontSize: '14px' }}>负责上传事件的线程池大小。根据实际带宽设置。</div>
+            <div style={{ fontSize: '14px' }}>
+              负责上传事件的线程池大小。根据实际带宽设置。保存后立即生效，调小不会中断正在进行的上传。
+            </div>
           }
           placeholder={3}
           label="上传线程池大小（pool2_size）"
