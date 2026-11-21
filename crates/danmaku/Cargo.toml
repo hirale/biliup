@@ -20,7 +20,7 @@ serde_json = { workspace = true }
 base64 = "0.22"
 
 # XML output
-quick-xml = { version = "0.37", features = ["serialize"] }
+quick-xml = { workspace = true, features = ["serialize"] }
 
 # Binary parsing
 nom = "8"
@@ -68,5 +68,5 @@ all-platforms = ["twitch", "twitcasting", "bilibili", "douyu", "huya", "douyin",
 
 [dev-dependencies]
 tracing-subscriber = { workspace = true }
-tokio = { workspace = true, features = ["full"] }
+tokio = { workspace = true, features = ["full", "test-util"] }
 futures = { workspace = true }

@@ -5,8 +5,10 @@ use crate::server::api::spa::static_handler;
 use crate::server::api::ws::ws_logs;
 use crate::server::api::{access, auth, web_users};
 use crate::server::errors::{AppError, AppResult};
+use crate::server::fleet::Fleet;
 use crate::server::infrastructure::service_register::ServiceRegister;
 use crate::server::infrastructure::users::Backend;
+use axum::Extension;
 use axum::http::HeaderValue;
 use axum::middleware::from_fn;
 use axum::routing::get;
@@ -17,7 +19,7 @@ use time::Duration;
 use tokio::net::TcpListener;
 use tokio::signal;
 use tokio::task::AbortHandle;
-use tower_http::cors::{AllowMethods, CorsLayer};
+use tower_http::cors::CorsLayer;
 use tower_sessions::{ExpiredDeletion, Expiry, SessionManagerLayer};
 use tower_sessions_sqlx_store::SqliteStore;
 use tracing::{error, info};
@@ -32,6 +34,7 @@ impl ApplicationController {
         enable_login_guard: bool,
         secure_session_cookie: bool,
         service_register: ServiceRegister,
+        fleet: Fleet,
         shutdown: Option<BoxFuture<'static, ()>>,
     ) -> AppResult<()> {
         // 会话层配置
@@ -41,6 +44,8 @@ impl ApplicationController {
             .migrate()
             .await
             .change_context(AppError::Unknown)?;
+
+        service_register.douyu_keeper.start();
 
         // 启动定期清理过期会话的任务
         let deletion_task = tokio::task::spawn(
@@ -72,37 +77,36 @@ impl ApplicationController {
 
         // 构建应用程序路由
         // 是否启用登录保护
-        let protected_routes =
+        let mut protected_routes =
             server::router::router(service_register.clone()).route("/v1/ws/logs", get(ws_logs));
+        if let Some(fleet_routes) = fleet.router() {
+            protected_routes = protected_routes.merge(fleet_routes);
+        }
+        protected_routes = fleet.guard(protected_routes);
         let mut app = with_optional_auth(protected_routes, enable_login_guard);
         app = app
+            .layer(Extension(fleet.capability()))
             .layer(auth_layer) // 添加认证层
-            .layer(
-                // CORS配置 - 跨域资源共享
-                // 详见 https://docs.rs/tower-http/latest/tower_http/cors/index.html
-                // 注意：对于某些请求类型（如POST application/json），
-                // 需要添加 ".allow_headers([http::header::CONTENT_TYPE])"
-                // 参考：https://github.com/tokio-rs/axum/issues/849
-                CorsLayer::new()
-                    .allow_headers([http::header::CONTENT_TYPE])
-                    .allow_origin("http://localhost:3000".parse::<HeaderValue>().unwrap())
-                    .allow_methods(AllowMethods::any()),
-            )
+            .layer(development_cors())
             .fallback(static_handler); // 静态文件处理回退
 
         // 启动HTTP服务器
         let addr = listener.local_addr().change_context(AppError::Unknown)?;
         info!("routes initialized, listening on {}", addr);
 
-        axum::serve(listener, app)
-            .with_graceful_shutdown(shutdown_signal(
-                deletion_task.abort_handle(),
-                service_register,
-                shutdown,
-            ))
-            .await
-            .change_context(AppError::Unknown)
-            .attach("error while starting API server")?;
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .with_graceful_shutdown(shutdown_signal(
+            deletion_task.abort_handle(),
+            service_register,
+            fleet,
+            shutdown,
+        ))
+        .await
+        .change_context(AppError::Unknown)
+        .attach("error while starting API server")?;
 
         // 等待会话清理任务完成
         match deletion_task.await {
@@ -128,6 +132,31 @@ impl ApplicationController {
     }
 }
 
+/// 开发前端与后端不同源时仍需保存并发送会话 Cookie。
+/// 带凭据的 CORS 不能使用通配 origin、methods 或 headers。
+fn development_cors() -> CorsLayer {
+    CorsLayer::new()
+        .allow_headers([http::header::CONTENT_TYPE])
+        .expose_headers([
+            http::HeaderName::from_static("x-dvr-start-ms"),
+            http::HeaderName::from_static("x-dvr-segment-id"),
+            http::HeaderName::from_static("x-biliup-full"),
+            http::HeaderName::from_static("x-biliup-filmstrip-layout"),
+            http::HeaderName::from_static("x-editor-frame"),
+        ])
+        .allow_origin(["http://localhost:3000".parse::<HeaderValue>().unwrap()])
+        .allow_credentials(true)
+        .allow_methods([
+            http::Method::GET,
+            http::Method::POST,
+            http::Method::PUT,
+            http::Method::PATCH,
+            http::Method::DELETE,
+            http::Method::HEAD,
+            http::Method::OPTIONS,
+        ])
+}
+
 /// 业务路由统一挂访问控制层：`--auth` 开启时校验登录与权限点（默认拒绝），
 /// 关闭时视为超管。登录相关接口与 `/v1/me*` 在这层之外。
 fn with_optional_auth(app: axum::Router<()>, enable_login_guard: bool) -> axum::Router<()> {
@@ -146,6 +175,7 @@ fn with_optional_auth(app: axum::Router<()>, enable_login_guard: bool) -> axum::
 async fn shutdown_signal(
     deletion_task_abort_handle: AbortHandle,
     service_register: ServiceRegister,
+    fleet: Fleet,
     shutdown: Option<BoxFuture<'static, ()>>,
 ) {
     match shutdown {
@@ -153,6 +183,7 @@ async fn shutdown_signal(
         None => os_shutdown_signal().await,
     }
     deletion_task_abort_handle.abort();
+    fleet.shutdown().await;
     service_register.cleanup().await;
 }
 
@@ -186,18 +217,106 @@ async fn os_shutdown_signal() {
 
 #[cfg(test)]
 mod tests {
-    use super::with_optional_auth;
+    use super::{development_cors, with_optional_auth};
     use crate::server::api::auth;
     use crate::server::infrastructure::connection_pool::ConnectionManager;
     use crate::server::infrastructure::users::Backend;
     use axum::Router;
     use axum::body::Body;
     use axum::http::{Request, StatusCode, header};
-    use axum::routing::get;
+    use axum::routing::{get, post};
     use axum_login::AuthManagerLayerBuilder;
     use tower::ServiceExt;
     use tower_sessions::SessionManagerLayer;
     use tower_sessions_sqlx_store::SqliteStore;
+
+    #[tokio::test]
+    async fn development_cors_allows_credentialed_login_preflight() {
+        let app = Router::new()
+            .route("/v1/users/login", post(|| async { StatusCode::OK }))
+            .layer(development_cors());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("OPTIONS")
+                    .uri("/v1/users/login")
+                    .header(header::ORIGIN, "http://localhost:3000")
+                    .header(header::ACCESS_CONTROL_REQUEST_METHOD, "POST")
+                    .header(header::ACCESS_CONTROL_REQUEST_HEADERS, "content-type")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let headers = response.headers();
+        assert_eq!(
+            headers[header::ACCESS_CONTROL_ALLOW_ORIGIN],
+            "http://localhost:3000"
+        );
+        assert_eq!(headers[header::ACCESS_CONTROL_ALLOW_CREDENTIALS], "true");
+        assert_eq!(
+            headers[header::ACCESS_CONTROL_ALLOW_HEADERS],
+            "content-type"
+        );
+        assert!(
+            headers[header::ACCESS_CONTROL_ALLOW_METHODS]
+                .to_str()
+                .unwrap()
+                .split(',')
+                .any(|method| method == "POST")
+        );
+    }
+
+    #[tokio::test]
+    async fn development_cors_allows_session_cookie_only_for_development_origin() {
+        let app = Router::new()
+            .route(
+                "/v1/users/login",
+                post(|| async {
+                    [(
+                        header::SET_COOKIE,
+                        "biliup.sid=test; HttpOnly; SameSite=Lax",
+                    )]
+                }),
+            )
+            .layer(development_cors());
+        for origin in ["http://localhost:3000", "https://other.example"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/v1/users/login")
+                        .header(header::ORIGIN, origin)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                response.headers()[header::SET_COOKIE],
+                "biliup.sid=test; HttpOnly; SameSite=Lax"
+            );
+            if origin == "http://localhost:3000" {
+                assert_eq!(
+                    response.headers()[header::ACCESS_CONTROL_ALLOW_ORIGIN],
+                    origin
+                );
+                assert_eq!(
+                    response.headers()[header::ACCESS_CONTROL_ALLOW_CREDENTIALS],
+                    "true"
+                );
+            } else {
+                assert!(
+                    !response
+                        .headers()
+                        .contains_key(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                );
+            }
+        }
+    }
 
     async fn request_log_route(enable_login_guard: bool) -> StatusCode {
         let dir = tempfile::tempdir().unwrap();

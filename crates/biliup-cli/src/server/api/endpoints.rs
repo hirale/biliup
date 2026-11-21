@@ -1,26 +1,33 @@
 use crate::server::api::access::Caller;
 use crate::server::api::live_preview::direct_capability;
 use crate::server::api::redact;
+use crate::server::auto_clip::runner::streamer_opted_in;
 use crate::server::common::recording_policy::{self, Rejection};
 use crate::server::common::upload::{build_studio, submit_to_bilibili, upload};
+use crate::server::common::upload_observation::{NewTask, UploadObservations};
 use crate::server::common::util::Recorder;
 use crate::server::config::Config;
 use crate::server::core::download_manager::DownloadManager;
-use crate::server::errors::{AppError, report_to_response};
+use crate::server::errors::{ApiError, AppError, report_to_response};
 use crate::server::infrastructure::connection_pool::ConnectionPool;
-use crate::server::infrastructure::context::{Stage, Worker, WorkerStatus};
+use crate::server::infrastructure::context::{Worker, WorkerStatus};
 use crate::server::infrastructure::dto::{LivePreviewResponse, LiveStreamerResponse};
 use crate::server::infrastructure::models::live_streamer::{InsertLiveStreamer, LiveStreamer};
 use crate::server::infrastructure::models::upload_streamer::{
     InsertUploadStreamer, UploadStreamer,
 };
 use crate::server::infrastructure::models::{Configuration, FileItem, StreamerInfo};
+use crate::server::infrastructure::permissions::Permission;
 use crate::server::infrastructure::policy::{Field, Subject};
 use crate::server::infrastructure::repositories::{
-    del_streamer, delete_bilibili_cookie, get_all_streamer, get_upload_config,
-    register_bilibili_cookie,
+    delete_bilibili_cookie, get_all_streamer, register_bilibili_cookie,
 };
 use crate::server::infrastructure::service_register::ServiceRegister;
+use crate::server::services::configuration::{ApplyConfigError, apply_config};
+use crate::server::services::streamers::{
+    AddStreamerError, add_streamer, delete_streamer, toggle_pause, update_streamer,
+};
+use crate::server::workbench;
 use crate::{LogHandle, UploadLine};
 use axum::Json;
 use axum::extract::{Path, State};
@@ -30,15 +37,14 @@ use biliup::credential::{Credential, save_login_info};
 use chrono::Utc;
 use clap::ValueEnum;
 use error_stack::{Report, ResultExt};
-use ormlite::{Insert, Model};
-use serde::Deserialize;
+use ormlite::Model;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, UNIX_EPOCH};
 use tokio::fs;
-use tracing::info;
-use tracing_subscriber::EnvFilter;
+use tracing::{info, warn};
 
 /// 主播当前被录制策略挡下的原因，供 `/v1/streamers` 覆盖状态字段。
 ///
@@ -58,16 +64,29 @@ pub async fn get_streamers_endpoint(
     caller: Caller,
     State(pool): State<ConnectionPool>,
     State(managers): State<Arc<DownloadManager>>,
+    State(config): State<Arc<RwLock<Config>>>,
 ) -> Result<Json<Vec<LiveStreamerResponse>>, Response> {
     let live_streamers = get_all_streamer(&pool).await.map_err(report_to_response)?;
-    let mut results = Vec::new();
     let workers = managers.get_rooms().await;
+    Ok(Json(
+        streamer_responses(&caller, &pool, &config, live_streamers, &workers).await,
+    ))
+}
+
+pub(super) async fn streamer_responses(
+    caller: &Caller,
+    pool: &ConnectionPool,
+    config: &Arc<RwLock<Config>>,
+    live_streamers: Vec<LiveStreamer>,
+    workers: &[Arc<Worker>],
+) -> Vec<LiveStreamerResponse> {
+    let mut results = Vec::with_capacity(live_streamers.len());
+    let workers: std::collections::HashMap<_, _> = workers.iter().map(|w| (w.id(), w)).collect();
     let show_hooks = caller.can_access(Field::StreamerHooks);
+    let show_after_live =
+        config.read().unwrap().auto_clip.is_some() && caller.can(Permission::ClipEdit);
     for mut x in live_streamers {
-        let option = workers
-            .clone()
-            .into_iter()
-            .find(|worker| worker.live_streamer.id == x.id);
+        let option = workers.get(&x.id).copied();
 
         let (status, live) = match option.as_ref() {
             Some(t) => {
@@ -91,7 +110,7 @@ pub async fn get_streamers_endpoint(
         // 在界面上都是「空闲」，用户无从判断配置有没有生效。
         // 时间类条件按当前时钟实时算，不依赖监控循环轮到这个房间，因此不会过期；
         // 依赖房间标题的结论来自最近一次探测。正在录制时不覆盖。
-        let status = match rejection_status(&x, option.as_deref()) {
+        let status = match rejection_status(&x, option.map(AsRef::as_ref)) {
             Some(reason) if status != "Working" => reason.to_string(),
             _ => status,
         };
@@ -99,10 +118,17 @@ pub async fn get_streamers_endpoint(
             Some((rate, media, preview)) => (rate, media, Some(preview)),
             None => (None, Default::default(), None),
         };
+        // Cached offline covers are read on demand by /cover, not during every list poll.
+        let live_cover_url = live_media.cover_url;
 
+        let auto_clip_after_live = show_after_live.then(|| streamer_opted_in(&x));
         if !show_hooks {
             strip_hooks(&mut x);
         }
+        let session_id = preview
+            .is_some()
+            .then(|| crate::server::workbench::live::session_of_streamer(x.id))
+            .flatten();
         results.push(LiveStreamerResponse {
             status,
             inner: x,
@@ -110,28 +136,49 @@ pub async fn get_streamers_endpoint(
                 .map(|t| format!("{:?}", *t.uploader_status.read().unwrap()))
                 .unwrap_or_default(),
             live_bytes_per_sec,
-            live_cover_url: live_media.cover_url,
+            live_streamer_name: live_media.streamer_name,
+            live_cover_url,
             live_avatar_url: live_media.avatar_url,
+            session_id,
+            marker_count: None,
             preview,
+            auto_clip_after_live,
         });
     }
-    Ok(Json(results))
+    fill_marker_counts(pool, &mut results).await;
+    results
 }
 
-/// 钩子走 `sh -c`、`override` 能覆盖任意全局配置，两者合起来等于服务器 shell，见 [`Field::StreamerHooks`]。
+/// 给录制中的房间填上本场的标记数；查询失败只记日志，这一轮不带标记数。
+async fn fill_marker_counts(pool: &ConnectionPool, results: &mut [LiveStreamerResponse]) {
+    let sessions: Vec<i64> = results.iter().filter_map(|r| r.session_id).collect();
+    if sessions.is_empty() {
+        return;
+    }
+    match crate::server::workbench::markers::counts(pool, &sessions).await {
+        Ok(counts) => {
+            for r in results.iter_mut() {
+                r.marker_count = r.session_id.map(|id| counts.get(&id).copied().unwrap_or(0));
+            }
+        }
+        Err(e) => tracing::warn!(error = %e, "读取标记数失败"),
+    }
+}
+
+/// 钩子走 `sh -c`、`override` 能覆盖任意全局配置、ffmpeg 参数能让 ffmpeg 写任意文件，
+/// 合起来等于服务器 shell，见 [`Field::StreamerHooks`]。
 fn strip_hooks(streamer: &mut LiveStreamer) {
     streamer.override_cfg = None;
     streamer.preprocessor = None;
     streamer.segment_processor = None;
     streamer.downloaded_processor = None;
     streamer.postprocessor = None;
+    streamer.opt_args = None;
 }
 
 pub async fn post_streamers_endpoint(
     caller: Caller,
     State(service_register): State<ServiceRegister>,
-    State(managers): State<Arc<DownloadManager>>,
-    State(pool): State<ConnectionPool>,
     Json(mut payload): Json<InsertLiveStreamer>,
 ) -> Result<Json<LiveStreamer>, Response> {
     if !caller.can_access(Field::StreamerHooks) {
@@ -140,33 +187,21 @@ pub async fn post_streamers_endpoint(
         payload.segment_processor = None;
         payload.downloaded_processor = None;
         payload.postprocessor = None;
+        payload.opt_args = None;
     }
-    let url = &payload.url.clone();
-    // You can insert the model directly.
-    let live_streamers = payload
-        .insert(&pool)
-        .await
-        .change_context(AppError::Unknown)
-        .map_err(report_to_response)?;
-    let upload_config = get_upload_config(&pool, live_streamers.id)
-        .await
-        .map_err(report_to_response)?;
-    let Some(_) = managers
-        .add_room(service_register.worker(live_streamers.clone(), upload_config))
-        .await
-    else {
-        info!("not supported url: {}", url);
-        return Err((StatusCode::BAD_REQUEST, "Not supported url").into_response());
-    };
-
-    info!(url = url, "successfully inserted new live streamers");
-    Ok(Json(live_streamers))
+    validate_streamer_mosaic(&payload.override_cfg).map_err(IntoResponse::into_response)?;
+    match add_streamer(&service_register, payload).await {
+        Ok(live_streamers) => Ok(Json(live_streamers)),
+        Err(AddStreamerError::UnsupportedUrl) => {
+            Err((StatusCode::BAD_REQUEST, "Not supported url").into_response())
+        }
+        Err(AddStreamerError::Internal(report)) => Err(report_to_response(report)),
+    }
 }
 
 pub async fn put_streamers_endpoint(
     caller: Caller,
     State(service_register): State<ServiceRegister>,
-    State(managers): State<Arc<DownloadManager>>,
     State(pool): State<ConnectionPool>,
     Json(mut payload): Json<LiveStreamer>,
 ) -> Result<Json<LiveStreamer>, Response> {
@@ -185,32 +220,46 @@ pub async fn put_streamers_endpoint(
         payload.segment_processor = current.segment_processor;
         payload.downloaded_processor = current.downloaded_processor;
         payload.postprocessor = current.postprocessor;
+        payload.opt_args = current.opt_args;
     }
-    let streamer = payload
-        .update_all_fields(&pool)
-        .await
-        .change_context(AppError::Unknown)
-        .map_err(report_to_response)?;
-
-    let id = streamer.id;
-    managers.del_room(id).await;
-
-    let upload_config = get_upload_config(&pool, id)
+    validate_streamer_mosaic(&payload.override_cfg).map_err(IntoResponse::into_response)?;
+    let mut streamer = update_streamer(&service_register, payload)
         .await
         .map_err(report_to_response)?;
-
-    managers
-        .add_room(service_register.worker(streamer.clone(), upload_config))
-        .await
-        .ok_or(AppError::Unknown)
-        .map_err(report_to_response)?;
-
-    info!(id = id, "successfully update live streamers");
-    let mut streamer = streamer;
     if !caller.can_access(Field::StreamerHooks) {
         strip_hooks(&mut streamer);
     }
     Ok(Json(streamer))
+}
+
+fn validate_streamer_mosaic(
+    patch: &Option<crate::server::config::ConfigPatch>,
+) -> Result<(), (StatusCode, Json<ApiError>)> {
+    let value = patch
+        .as_ref()
+        .and_then(|patch| patch.mosaic_config.as_ref())
+        .and_then(|value| value.clone());
+    let duration = patch
+        .as_ref()
+        .and_then(|patch| patch.segment_time.as_ref())
+        .and_then(|value| value.clone());
+    let mut config = Config {
+        mosaic_config: value,
+        segment_time: duration,
+        ..Config::default()
+    };
+    config.normalize_segment_limits();
+    config.validate_segment_limits().map_err(|_| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(ApiError::new(
+                "视频分段时长格式无效，请输入大于 0 的时:分:秒、分:秒或秒数".to_string(),
+            )),
+        )
+    })?;
+    config
+        .validate_mosaic()
+        .map_err(|message| (StatusCode::BAD_REQUEST, Json(ApiError::new(message))))
 }
 
 pub async fn delete_streamers_endpoint(
@@ -218,10 +267,9 @@ pub async fn delete_streamers_endpoint(
     State(pool): State<ConnectionPool>,
     Path(id): Path<i64>,
 ) -> Result<Json<LiveStreamer>, Response> {
-    managers.del_room(id).await;
-
-    let live_streamers = del_streamer(&pool, id).await.map_err(report_to_response)?;
-    info!(workers=?live_streamers, "successfully inserted new live streamers");
+    let live_streamers = delete_streamer(&pool, &managers, id)
+        .await
+        .map_err(report_to_response)?;
     Ok(Json(live_streamers))
 }
 
@@ -230,33 +278,9 @@ pub async fn pause_streamers_endpoint(
     State(managers): State<Arc<DownloadManager>>,
     Path(id): Path<i64>,
 ) -> Result<Json<()>, Response> {
-    let worker = managers.get_room_by_id(id).await;
-    if let Some(w) = worker {
-        let worker_status = w.downloader_status.read().unwrap().clone();
-        match worker_status {
-            WorkerStatus::Working(_) => {
-                w.change_status(Stage::Download, WorkerStatus::Pause).await;
-                info!(url=?&w.live_streamer.url, "successfully pause live streamers");
-                managers.make_waker(id).await;
-            }
-            WorkerStatus::Pause => {
-                w.change_status(Stage::Download, WorkerStatus::Idle).await;
-                managers.wake_waker(id).await;
-                info!(url=?&w.live_streamer.url, "successfully start live streamers");
-            }
-            WorkerStatus::Pending => {
-                w.change_status(Stage::Download, WorkerStatus::Pause).await;
-                managers.make_waker(id).await;
-                info!(url=?&w.live_streamer.url, "successfully pause live streamers");
-            }
-            WorkerStatus::Idle => {
-                w.change_status(Stage::Download, WorkerStatus::Pause).await;
-                managers.make_waker(id).await;
-                info!(url=?&w.live_streamer.url, "successfully pause live streamers");
-            }
-        };
-    }
-
+    toggle_pause(&managers, id)
+        .await
+        .map_err(report_to_response)?;
     Ok(Json(()))
 }
 
@@ -264,7 +288,8 @@ pub async fn get_configuration(
     caller: Caller,
     State(config): State<Arc<RwLock<Config>>>,
 ) -> Result<Json<serde_json::Value>, Response> {
-    let config = config.read().unwrap().clone();
+    let mut config = config.read().unwrap().clone();
+    redact::mask_api_keys(&mut config);
     if caller.can_access(Field::ConfigSecrets) {
         return serde_json::to_value(config)
             .map(Json)
@@ -278,121 +303,57 @@ pub async fn get_configuration(
 pub async fn put_configuration(
     State(config): State<Arc<RwLock<Config>>>,
     State(pool): State<ConnectionPool>,
+    State(managers): State<Arc<DownloadManager>>,
     State(log_handle): State<LogHandle>,
     Json(json_data): Json<Config>,
 ) -> Result<Json<Config>, Response> {
-    let mut json_data = json_data;
-    json_data.normalize_segment_limits();
-    json_data
-        .validate_segment_limits()
-        .map_err(report_to_response)?;
-    // 将 JSON 序列化为 TEXT 存库
-    let value_txt = serde_json::to_string(&json_data)
-        .change_context(AppError::Unknown)
-        .map_err(report_to_response)?;
-
-    let mut tx = pool
-        .begin()
+    apply_config(&config, &pool, &managers, &log_handle, json_data)
         .await
-        .change_context(AppError::Unknown)
-        .map_err(report_to_response)?;
+        .map(|mut saved| {
+            redact::mask_api_keys(&mut saved);
+            Json(saved)
+        })
+        .map_err(|e| match e {
+            ApplyConfigError::Invalid(message) => {
+                (StatusCode::BAD_REQUEST, Json(ApiError::new(message))).into_response()
+            }
+            ApplyConfigError::Internal(report) => report_to_response(report),
+        })
+}
 
-    // 最多取 2 条判断是否多行
-    let ids: Vec<i64> =
-        sqlx::query_scalar::<_, i64>("SELECT id FROM configuration WHERE key = ?1 LIMIT 2")
-            .bind("config")
-            .fetch_all(&mut *tx)
-            .await
-            .change_context(AppError::Unknown)
-            .map_err(report_to_response)?;
-
-    let saved: Configuration = if ids.is_empty() {
-        // 插入
-        sqlx::query("INSERT INTO configuration (key, value) VALUES (?1, ?2)")
-            .bind("config")
-            .bind(&value_txt)
-            .execute(&mut *tx)
-            .await
-            .change_context(AppError::Unknown)
-            .map_err(report_to_response)?;
-
-        // 取 last_insert_rowid 并读回整行
-        let id: i64 = sqlx::query_scalar::<_, i64>("SELECT last_insert_rowid()")
-            .fetch_one(&mut *tx)
-            .await
-            .change_context(AppError::Unknown)
-            .map_err(report_to_response)?;
-
-        sqlx::query_as::<_, Configuration>("SELECT id, key, value FROM configuration WHERE id = ?1")
-            .bind(id)
-            .fetch_one(&mut *tx)
-            .await
-            .change_context(AppError::Unknown)
-            .map_err(report_to_response)?
-    } else if ids.len() == 1 {
-        // 更新
-        let id = ids[0];
-        sqlx::query("UPDATE configuration SET value = ?1 WHERE id = ?2")
-            .bind(&value_txt)
-            .bind(id)
-            .execute(&mut *tx)
-            .await
-            .change_context(AppError::Unknown)
-            .map_err(report_to_response)?;
-
-        sqlx::query_as::<_, Configuration>("SELECT id, key, value FROM configuration WHERE id = ?1")
-            .bind(id)
-            .fetch_one(&mut *tx)
-            .await
-            .change_context(AppError::Unknown)
-            .map_err(report_to_response)?
-    } else {
-        // 多行报错
-        return Err(report_to_response(Report::new(AppError::Custom(
-            format!("有多个空间配置同时存在 (key='config'): {} 行", ids.len()).to_string(),
-        ))));
-    };
-
-    tx.commit()
-        .await
-        .change_context(AppError::Unknown)
-        .map_err(report_to_response)?;
-    // 提交后从 DB 重新加载配置
-    let mut saved_config: Config = serde_json::from_str(&saved.value)
-        .change_context(AppError::Unknown)
-        .map_err(report_to_response)?;
-    saved_config.normalize_segment_limits();
-    saved_config
-        .validate_segment_limits()
-        .map_err(report_to_response)?;
-    crate::tools::set_configured_ffmpeg(saved_config.ffmpeg_path.as_deref());
-    *config.write().unwrap() = saved_config;
-    let guard = config.read().unwrap();
-    if let Some(loggers_level) = &guard.loggers_level {
-        let new_filter = EnvFilter::try_new(loggers_level)
-            .change_context(AppError::Custom(String::from("Invalid log level format")))
-            .map_err(report_to_response)?;
-
-        log_handle
-            .modify(|filter| *filter = new_filter)
-            .change_context(AppError::Unknown)
-            .map_err(report_to_response)?;
-    }
-
-    Ok(Json(guard.clone()))
+/// `/v1/streamer-info` 的一行：场次行本身，外加能不能在回看页打开。
+#[derive(Debug, Serialize)]
+pub struct StreamerInfoView {
+    #[serde(flatten)]
+    pub info: StreamerInfo,
+    /// 这一场有时间轴（升级后录的、写出过分段），能按场次回看。
+    pub has_timeline: bool,
 }
 
 pub async fn get_streamer_info(
     // Extension(streamers_service): Extension<DynUploadStreamersRepository>,
     State(pool): State<ConnectionPool>,
-) -> Result<Json<Vec<StreamerInfo>>, Response> {
+) -> Result<Json<Vec<StreamerInfoView>>, Response> {
     let streamer_infos = StreamerInfo::select()
+        .where_("kind = 'source'")
         .fetch_all(&pool)
         .await
         .change_context(AppError::Unknown)
         .map_err(report_to_response)?;
+    let with_timeline = workbench::store::sessions_with_timeline(&pool)
+        .await
+        .change_context(AppError::Unknown)
+        .map_err(report_to_response)?;
 
-    Ok(Json(streamer_infos))
+    Ok(Json(
+        streamer_infos
+            .into_iter()
+            .map(|info| StreamerInfoView {
+                has_timeline: with_timeline.contains(&info.id),
+                info,
+            })
+            .collect(),
+    ))
 }
 
 pub async fn get_streamer_info_files(
@@ -401,7 +362,7 @@ pub async fn get_streamer_info_files(
     Path(id): Path<i64>,
 ) -> Result<Json<Vec<FileItem>>, Response> {
     let file_items = FileItem::select()
-        .where_("streamer_info_id = ?")
+        .where_("session_id = ?")
         .bind(id)
         .fetch_all(&pool)
         .await
@@ -412,15 +373,55 @@ pub async fn get_streamer_info_files(
 }
 
 pub async fn get_upload_streamers_endpoint(
+    caller: Caller,
     // Extension(streamers_service): Extension<DynUploadStreamersRepository>,
     State(pool): State<ConnectionPool>,
-) -> Result<Json<Vec<UploadStreamer>>, Response> {
+) -> Result<Json<Vec<serde_json::Value>>, Response> {
     let uploader_streamers = UploadStreamer::select()
         .fetch_all(&pool)
         .await
         .change_context(AppError::Unknown)
         .map_err(report_to_response)?;
-    Ok(Json(uploader_streamers))
+    let mut response = Vec::with_capacity(uploader_streamers.len());
+    for template in uploader_streamers {
+        response.push(template_view(&caller.subject, &pool, &template).await?);
+    }
+    Ok(Json(response))
+}
+
+async fn template_view(
+    subject: &Subject,
+    pool: &ConnectionPool,
+    template: &impl Serialize,
+) -> Result<serde_json::Value, Response> {
+    let mut view = serde_json::to_value(template)
+        .change_context(AppError::Unknown)
+        .map_err(report_to_response)?;
+    if !subject.can_access(Field::TemplateCoverPath) {
+        view["cover_path"] = serde_json::Value::Null;
+    }
+    if !subject.can_access(Field::TemplateAccount) {
+        let selector = if let Some(path) =
+            view["user_cookie"].as_str().filter(|path| !path.is_empty())
+        {
+            let id: Option<i64> = sqlx::query_scalar(
+                "SELECT id FROM configuration WHERE key = 'bilibili-cookies' AND value = ? ORDER BY id LIMIT 1",
+            )
+            .bind(path)
+            .fetch_optional(pool)
+            .await
+            .change_context(AppError::Unknown)
+            .map_err(report_to_response)?;
+            Some(id.map_or_else(
+                || "account:current".to_string(),
+                |id| format!("account:{id}"),
+            ))
+        } else {
+            None
+        };
+        view["user_cookie"] = serde_json::to_value(selector).unwrap_or_default();
+    }
+    Ok(view)
 }
 
 /// 保存投稿模板时的两个受保护字段：没有 [`Field::TemplateAccount`] 的人只能从已登记的
@@ -432,9 +433,6 @@ async fn protect_template_fields(
 ) -> Result<(), Response> {
     let keep_cover = !subject.can_access(Field::TemplateCoverPath);
     let check_account = !subject.can_access(Field::TemplateAccount);
-    if !keep_cover && !check_account {
-        return Ok(());
-    }
     let current = match upload_streamer.id {
         Some(id) => UploadStreamer::select()
             .where_("id = ?")
@@ -450,26 +448,58 @@ async fn protect_template_fields(
             .as_ref()
             .and_then(|template| template.cover_path.clone());
     }
-    if !check_account {
-        return Ok(());
-    }
     let Some(cookie) = upload_streamer
         .user_cookie
         .as_deref()
         .filter(|c| !c.is_empty())
     else {
+        if check_account {
+            upload_streamer.user_cookie = current.and_then(|template| template.user_cookie);
+        }
         return Ok(());
     };
+    // Non-account managers receive an opaque `account:<id>` selector. Resolve
+    // it server-side so the API never needs to expose credential file paths.
+    let resolved_cookie = if let Some(id) = cookie.strip_prefix("account:") {
+        if id == "current" {
+            upload_streamer.user_cookie = current
+                .as_ref()
+                .and_then(|template| template.user_cookie.clone())
+                .filter(|path| !path.is_empty());
+            if upload_streamer.user_cookie.is_none() {
+                return Err((StatusCode::BAD_REQUEST, "没有可保留的投稿账号").into_response());
+            }
+            return Ok(());
+        }
+        let id = id
+            .parse::<i64>()
+            .map_err(|_| (StatusCode::BAD_REQUEST, "账号 ID 无效").into_response())?;
+        Configuration::select()
+            .where_("id = ? AND key = 'bilibili-cookies'")
+            .bind(id)
+            .fetch_optional(pool)
+            .await
+            .change_context(AppError::Unknown)
+            .map_err(report_to_response)?
+            .ok_or_else(|| (StatusCode::FORBIDDEN, "只能选择已登记的 B 站账号").into_response())?
+            .value
+    } else {
+        cookie.to_string()
+    };
+    upload_streamer.user_cookie = Some(resolved_cookie.clone());
+    if !check_account {
+        return Ok(());
+    }
     if current
         .as_ref()
-        .is_some_and(|template| template.user_cookie.as_deref() == Some(cookie))
+        .is_some_and(|template| template.user_cookie.as_deref() == Some(resolved_cookie.as_str()))
     {
         return Ok(());
     }
     let registered: i64 = sqlx::query_scalar(
         "SELECT EXISTS(SELECT 1 FROM configuration WHERE key = 'bilibili-cookies' AND value = ?)",
     )
-    .bind(cookie)
+    .bind(&resolved_cookie)
     .fetch_one(pool)
     .await
     .change_context(AppError::Unknown)
@@ -486,50 +516,37 @@ pub async fn add_upload_streamer_endpoint(
     Json(mut upload_streamer): Json<InsertUploadStreamer>,
 ) -> Result<Json<serde_json::Value>, Response> {
     protect_template_fields(&caller.subject, &pool, &mut upload_streamer).await?;
-    if upload_streamer.id.is_none() {
-        Ok(Json(
-            serde_json::to_value(
-                ormlite::Insert::insert(upload_streamer, &pool)
-                    .await
-                    .change_context(AppError::Unknown)
-                    .map_err(report_to_response)?,
-            )
-            .change_context(AppError::Unknown)
-            .map_err(report_to_response)?,
-        ))
+    let response = if upload_streamer.id.is_none() {
+        template_view(
+            &caller.subject,
+            &pool,
+            &ormlite::Insert::insert(upload_streamer, &pool)
+                .await
+                .change_context(AppError::Unknown)
+                .map_err(report_to_response)?,
+        )
+        .await?
     } else {
-        Ok(Json(
-            serde_json::to_value(
-                upload_streamer
-                    .update_all_fields(&pool)
-                    .await
-                    .change_context(AppError::Unknown)
-                    .map_err(report_to_response)?,
-            )
-            .change_context(AppError::Unknown)
-            .map_err(report_to_response)?,
-        ))
-    }
+        template_view(
+            &caller.subject,
+            &pool,
+            &upload_streamer
+                .update_all_fields(&pool)
+                .await
+                .change_context(AppError::Unknown)
+                .map_err(report_to_response)?,
+        )
+        .await?
+    };
+    Ok(Json(response))
 }
 
 pub async fn get_upload_streamer_endpoint(
+    caller: Caller,
     State(pool): State<ConnectionPool>,
     Path(id): Path<i64>,
-) -> Result<Json<UploadStreamer>, Response> {
-    let uploader_streamers = UploadStreamer::select()
-        .where_("id = ?")
-        .bind(id)
-        .fetch_one(&pool)
-        .await
-        .change_context(AppError::Unknown)
-        .map_err(report_to_response)?;
-    Ok(Json(uploader_streamers))
-}
-pub async fn delete_template_endpoint(
-    State(pool): State<ConnectionPool>,
-    Path(id): Path<i64>,
-) -> Result<Json<()>, Response> {
-    let uploader_streamers = UploadStreamer::select()
+) -> Result<Json<serde_json::Value>, Response> {
+    let uploader_streamer = UploadStreamer::select()
         .where_("id = ?")
         .bind(id)
         .fetch_one(&pool)
@@ -537,15 +554,48 @@ pub async fn delete_template_endpoint(
         .change_context(AppError::Unknown)
         .map_err(report_to_response)?;
     Ok(Json(
-        uploader_streamers
-            .delete(&pool)
+        template_view(&caller.subject, &pool, &uploader_streamer).await?,
+    ))
+}
+/// 有主播在用的模板不删（409）：`livestreamers.upload_streamers_id` 是 `ON DELETE CASCADE`，
+/// 直接删会把绑着它的主播一起从库里删掉，而它们在监控里的房间还照常录、传。
+/// 判断与删除在同一条语句里，不会和并发的「主播改用这个模板」错开。
+pub async fn delete_template_endpoint(
+    State(pool): State<ConnectionPool>,
+    Path(id): Path<i64>,
+) -> Result<Json<()>, Response> {
+    let deleted = sqlx::query(
+        "DELETE FROM uploadstreamers WHERE id = ?1
+           AND NOT EXISTS (SELECT 1 FROM livestreamers WHERE upload_streamers_id = ?1)",
+    )
+    .bind(id)
+    .execute(&pool)
+    .await
+    .change_context(AppError::Unknown)
+    .map_err(report_to_response)?
+    .rows_affected();
+    if deleted > 0 {
+        return Ok(Json(()));
+    }
+    let in_use: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM livestreamers WHERE upload_streamers_id = ?")
+            .bind(id)
+            .fetch_one(&pool)
             .await
             .change_context(AppError::Unknown)
-            .map_err(report_to_response)?,
-    ))
+            .map_err(report_to_response)?;
+    if in_use > 0 {
+        return Err((
+            StatusCode::CONFLICT,
+            format!("还有 {in_use} 个主播在用这个模板，先给它们换个模板再删除"),
+        )
+            .into_response());
+    }
+    Err((StatusCode::NOT_FOUND, "上传模板不存在").into_response())
 }
 
 pub async fn get_users_endpoint(
+    caller: Caller,
     State(pool): State<ConnectionPool>,
 ) -> Result<Json<Vec<serde_json::Value>>, Response> {
     let configurations = Configuration::select()
@@ -556,10 +606,11 @@ pub async fn get_users_endpoint(
         .map_err(report_to_response)?;
     let mut res = Vec::new();
     for cookies in configurations {
+        let can_see_path = caller.can_access(Field::TemplateAccount);
         res.push(json!({
             "id": cookies.id,
-            "name": cookies.value,
-            "value": cookies.value,
+            "name": if can_see_path { cookies.value.clone() } else { format!("账号 #{}", cookies.id) },
+            "value": if can_see_path { cookies.value } else { format!("account:{}", cookies.id) },
             "platform": cookies.key,
         }))
     }
@@ -635,12 +686,20 @@ mod user_payload_tests {
 
 #[cfg(test)]
 mod template_field_tests {
-    use super::protect_template_fields;
+    use super::{
+        add_upload_streamer_endpoint, get_upload_streamer_endpoint, get_users_endpoint,
+        protect_template_fields,
+    };
+    use crate::server::api::access::Caller;
     use crate::server::infrastructure::connection_pool::ConnectionManager;
     use crate::server::infrastructure::models::upload_streamer::InsertUploadStreamer;
     use crate::server::infrastructure::permissions::Role;
     use crate::server::infrastructure::policy::Subject;
     use axum::http::StatusCode;
+    use axum::{
+        Json,
+        extract::{Path, State},
+    };
     use ormlite::Model;
 
     fn template(id: Option<i64>, cookie: &str, cover: &str) -> InsertUploadStreamer {
@@ -652,6 +711,104 @@ mod template_field_tests {
             "tags": [],
         }))
         .unwrap()
+    }
+
+    fn operator() -> Caller {
+        let mut caller = Caller::unrestricted();
+        caller.subject = Subject::user(2, Role::Operator);
+        caller
+    }
+
+    #[tokio::test]
+    async fn operator_edits_preserve_bindings_without_exposing_credential_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = ConnectionManager::new_pool(dir.path().join("data.sqlite3").to_str().unwrap())
+            .await
+            .unwrap();
+        let account = sqlx::query("INSERT INTO configuration (key, value) VALUES ('bilibili-cookies', '/srv/private/account.json')")
+            .execute(&pool).await.unwrap().last_insert_rowid();
+        let saved = template(None, "/srv/private/account.json", "/srv/private/cover.jpg")
+            .insert(&pool)
+            .await
+            .unwrap();
+        let users = get_users_endpoint(operator(), State(pool.clone()))
+            .await
+            .unwrap()
+            .0;
+        let selector = format!("account:{account}");
+        assert_eq!(users[0]["value"], selector);
+        assert!(
+            !serde_json::to_string(&users)
+                .unwrap()
+                .contains("/srv/private")
+        );
+
+        let id = saved.id.unwrap();
+        let read = get_upload_streamer_endpoint(operator(), State(pool.clone()), Path(id))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(read["user_cookie"], selector);
+        assert!(read["cover_path"].is_null());
+        // Simulate the edit form: the visible selection and a changed title
+        // are submitted, while the hidden cover path remains null.
+        let mut edit = template(Some(id), read["user_cookie"].as_str().unwrap(), "");
+        edit.title = Some("changed title".into());
+        let written = add_upload_streamer_endpoint(operator(), State(pool.clone()), Json(edit))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(written["user_cookie"], selector);
+        assert!(written["cover_path"].is_null());
+        assert!(!written.to_string().contains("/srv/private"));
+        let admin =
+            get_upload_streamer_endpoint(Caller::unrestricted(), State(pool.clone()), Path(id))
+                .await
+                .unwrap()
+                .0;
+        assert_eq!(admin["user_cookie"], "/srv/private/account.json");
+        assert_eq!(admin["cover_path"], "/srv/private/cover.jpg");
+        assert_eq!(admin["title"], "changed title");
+
+        let saved = template(None, "unregistered.json", "/srv/private/cover.jpg")
+            .insert(&pool)
+            .await
+            .unwrap();
+        let id = saved.id.unwrap();
+        let read = get_upload_streamer_endpoint(operator(), State(pool.clone()), Path(id))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(read["user_cookie"], "account:current");
+        let edit = template(Some(id), "account:current", "");
+        let written = add_upload_streamer_endpoint(operator(), State(pool.clone()), Json(edit))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(written["user_cookie"], "account:current");
+        let admin =
+            get_upload_streamer_endpoint(Caller::unrestricted(), State(pool.clone()), Path(id))
+                .await
+                .unwrap()
+                .0;
+        assert_eq!(admin["user_cookie"], "unregistered.json");
+
+        let mut forged = template(None, "account:current", "");
+        assert_eq!(
+            protect_template_fields(&operator().subject, &pool, &mut forged)
+                .await
+                .unwrap_err()
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+        let mut missing = template(None, "account:999999", "");
+        assert_eq!(
+            protect_template_fields(&operator().subject, &pool, &mut missing)
+                .await
+                .unwrap_err()
+                .status(),
+            StatusCode::FORBIDDEN
+        );
     }
 
     #[tokio::test]
@@ -707,6 +864,216 @@ mod template_field_tests {
     }
 }
 
+#[cfg(test)]
+mod streamer_hook_tests {
+    use super::{get_streamers_endpoint, post_streamers_endpoint, put_streamers_endpoint};
+    use crate::server::api::access::Caller;
+    use crate::server::config::Config;
+    use crate::server::core::download_manager::DownloadManager;
+    use crate::server::infrastructure::connection_pool::ConnectionManager;
+    use crate::server::infrastructure::models::live_streamer::LiveStreamer;
+    use crate::server::infrastructure::permissions::Role;
+    use crate::server::infrastructure::policy::Subject;
+    use crate::server::infrastructure::service_register::ServiceRegister;
+    use axum::Json;
+    use axum::extract::State;
+    use biliup::downloader::live::{LivePlugin, LiveRequest, LiveResult, LiveStatus};
+    use ormlite::Model;
+    use serde_json::json;
+    use std::sync::{Arc, RwLock};
+    use tracing_subscriber::{EnvFilter, reload};
+
+    /// 只认 `https://stuck.example/` 的平台；检测一直不返回，不会向任何真实平台发请求
+    struct StuckPlatform;
+
+    #[async_trait::async_trait]
+    impl LivePlugin for StuckPlatform {
+        fn name(&self) -> &'static str {
+            "stuck"
+        }
+
+        fn matches(&self, url: &str) -> bool {
+            url.starts_with("https://stuck.example/")
+        }
+
+        async fn check_stream(&self, _request: LiveRequest) -> LiveResult<LiveStatus> {
+            std::future::pending().await
+        }
+    }
+
+    fn operator() -> Caller {
+        let mut caller = Caller::unrestricted();
+        caller.subject = Subject::user(2, Role::Operator);
+        caller
+    }
+
+    #[tokio::test]
+    async fn operators_neither_see_nor_change_ffmpeg_args() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = ConnectionManager::new_pool(dir.path().join("data.sqlite3").to_str().unwrap())
+            .await
+            .unwrap();
+        let managers = DownloadManager::new(1, 1, pool.clone());
+        managers.add_plugin(Arc::new(StuckPlatform)).await;
+        let (_layer, log_handle) = reload::Layer::new(EnvFilter::new("info"));
+        let config = Arc::new(RwLock::new(Config::default()));
+        let services = ServiceRegister::new(pool.clone(), config, managers, log_handle).await;
+        let stored = |id: i64| {
+            let pool = pool.clone();
+            async move {
+                LiveStreamer::select()
+                    .where_("id = ?")
+                    .bind(id)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap()
+                    .opt_args
+            }
+        };
+
+        // 新建：没有钩子权限的人带上的 ffmpeg 参数不落库
+        let body = json!({
+            "url": "https://stuck.example/1",
+            "remark": "r",
+            "opt_args": ["-f", "ffmetadata", "/tmp/x"],
+        });
+        let Json(created) = post_streamers_endpoint(
+            operator(),
+            State(services.clone()),
+            Json(serde_json::from_value(body).unwrap()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(stored(created.id).await, None);
+
+        let admin_args = json!(["-metadata", "comment=admin"]);
+        let mut edit = created.clone();
+        edit.opt_args = Some(admin_args.clone());
+        let Json(saved) = put_streamers_endpoint(
+            Caller::unrestricted(),
+            State(services.clone()),
+            State(pool.clone()),
+            Json(edit),
+        )
+        .await
+        .unwrap();
+        assert_eq!(saved.opt_args, Some(admin_args.clone()));
+        assert_eq!(stored(created.id).await, Some(admin_args.clone()));
+
+        // 列表里看不到
+        let list = |caller: Caller| {
+            let services = services.clone();
+            async move {
+                let Json(list) = get_streamers_endpoint(
+                    caller,
+                    State(services.pool),
+                    State(services.managers),
+                    State(services.config),
+                )
+                .await
+                .unwrap();
+                list[0].inner.opt_args.clone()
+            }
+        };
+        assert_eq!(list(operator()).await, None);
+        assert_eq!(list(Caller::unrestricted()).await, Some(admin_args.clone()));
+
+        // 整体覆盖保存：请求体里的 ffmpeg 参数不算数，以库里原值为准，回包里也不带
+        let mut edit = created.clone();
+        edit.remark = "改了备注".into();
+        edit.opt_args = Some(json!(["-f", "ffmetadata", "/tmp/x"]));
+        let Json(saved) = put_streamers_endpoint(
+            operator(),
+            State(services.clone()),
+            State(pool.clone()),
+            Json(edit),
+        )
+        .await
+        .unwrap();
+        assert_eq!(saved.remark, "改了备注");
+        assert_eq!(saved.opt_args, None);
+        assert_eq!(stored(created.id).await, Some(admin_args));
+    }
+}
+
+#[cfg(test)]
+mod template_delete_tests {
+    use super::delete_template_endpoint;
+    use crate::server::infrastructure::connection_pool::ConnectionManager;
+    use crate::server::infrastructure::models::live_streamer::{InsertLiveStreamer, LiveStreamer};
+    use crate::server::infrastructure::models::upload_streamer::{
+        InsertUploadStreamer, UploadStreamer,
+    };
+    use axum::extract::{Path, State};
+    use axum::http::StatusCode;
+    use ormlite::{Insert, Model};
+
+    /// `livestreamers.upload_streamers_id` 是 `ON DELETE CASCADE`：直接删模板会连带删掉绑着它的主播
+    /// （库里没了，监控里的房间却还在录）。有主播在用时必须拒绝，什么都不删。
+    #[tokio::test]
+    async fn deleting_a_template_in_use_keeps_it_and_its_streamers() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("data.sqlite3");
+        let pool = ConnectionManager::new_pool(db.to_str().unwrap())
+            .await
+            .unwrap();
+        let template = |name: &str| -> InsertUploadStreamer {
+            serde_json::from_value(serde_json::json!({ "template_name": name, "tags": [] }))
+                .unwrap()
+        };
+        let used = Insert::insert(template("used"), &pool).await.unwrap();
+        let unused = Insert::insert(template("unused"), &pool).await.unwrap();
+        let streamer: InsertLiveStreamer = serde_json::from_value(serde_json::json!({
+            "url": "https://live.example.com/1",
+            "remark": "a",
+            "upload_streamers_id": used.id,
+        }))
+        .unwrap();
+        let streamer = streamer.insert(&pool).await.unwrap();
+
+        let rejected = delete_template_endpoint(State(pool.clone()), Path(used.id))
+            .await
+            .unwrap_err();
+        assert_eq!(rejected.status(), StatusCode::CONFLICT);
+        let kept = LiveStreamer::select()
+            .where_("id = ?")
+            .bind(streamer.id)
+            .fetch_optional(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            kept.and_then(|s| s.upload_streamers_id),
+            Some(used.id),
+            "主播与它绑定的模板都要留着"
+        );
+        let template_exists = |id: i64| {
+            let pool = pool.clone();
+            async move {
+                UploadStreamer::select()
+                    .where_("id = ?")
+                    .bind(id)
+                    .fetch_optional(&pool)
+                    .await
+                    .unwrap()
+                    .is_some()
+            }
+        };
+        assert!(template_exists(used.id).await);
+
+        // 没人用的模板照常删除；再删一次是 404，不是 500
+        assert!(
+            delete_template_endpoint(State(pool.clone()), Path(unused.id))
+                .await
+                .is_ok()
+        );
+        assert!(!template_exists(unused.id).await);
+        let missing = delete_template_endpoint(State(pool.clone()), Path(unused.id))
+            .await
+            .unwrap_err();
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+    }
+}
+
 pub async fn delete_user_endpoint(
     Path(id): Path<i64>,
     State(pool): State<ConnectionPool>,
@@ -758,9 +1125,22 @@ pub async fn login_by_qrcode(
     Ok(Json(json!({ "filename": filename })))
 }
 
-pub async fn get_videos() -> Result<Json<Vec<serde_json::Value>>, Response> {
+/// `GET /v1/videos`：工作目录下的录像文件。属于某一场、能按场次回看的文件另带 `session_id` 和
+/// `segment_start_ms`（这一段在场次时间轴上的起点），前端据此打开回看页并定位到这一段。
+pub async fn get_videos(
+    State(pool): State<ConnectionPool>,
+) -> Result<Json<Vec<serde_json::Value>>, Response> {
     let media_extensions = [".mp4", ".flv", ".3gp", ".webm", ".mkv", ".ts"];
     let blacklist = ["next-env.d.ts"];
+    let segments = match workbench::store::replayable_segment_files(&pool).await {
+        Ok(files) => files,
+        Err(error) => {
+            warn!(%error, "读取分段失败，录像列表不带场次");
+            Vec::new()
+        }
+    };
+    let cwd = std::env::current_dir().ok();
+    let segments = workbench::store::segment_files_in_dir(segments, cwd.as_deref());
 
     let mut file_list = Vec::new();
     let mut index = 1;
@@ -788,12 +1168,17 @@ pub async fn get_videos() -> Result<Json<Vec<serde_json::Value>>, Response> {
                     .map(|d| d.as_secs())
                     .unwrap_or(0);
 
-                file_list.push(serde_json::json!({
+                let mut item = serde_json::json!({
                     "key": index,
                     "name": file_name,
                     "updateTime": mtime,
                     "size": metadata.len(),
-                }));
+                });
+                if let Some(segment) = segments.get(&file_name) {
+                    item["session_id"] = segment.session_id.into();
+                    item["segment_start_ms"] = segment.start_ms.into();
+                }
+                file_list.push(item);
                 index += 1;
             }
         }
@@ -833,17 +1218,19 @@ pub async fn get_status(
         }
         sw.push(room);
     }
+    let mut config = config.read().unwrap().clone();
+    redact::mask_api_keys(&mut config);
     let config = if caller.can_access(Field::ConfigSecrets) {
-        serde_json::to_value(&*config.read().unwrap()).unwrap_or_default()
+        serde_json::to_value(&config).unwrap_or_default()
     } else {
-        redact::config(&*config.read().unwrap())
+        redact::config(&config)
     };
 
     Ok(Json(serde_json::json!({
         "version": env!("CARGO_PKG_VERSION"),
         "rooms": sw,
-        "download_semaphore": managers.download_semaphore,
-        "update_semaphore": managers.u_kills.len(),
+        "download_semaphore": managers.download_pool_size(),
+        "update_semaphore": managers.upload_pool_size(),
         "config": config,
     })))
 }
@@ -859,6 +1246,7 @@ pub struct PostUploads {
 pub async fn post_uploads(
     State(config): State<Arc<RwLock<Config>>>,
     State(pool): State<ConnectionPool>,
+    State(observations): State<Arc<UploadObservations>>,
     Json(json_data): Json<PostUploads>,
 ) -> Result<Json<serde_json::Value>, Response> {
     let upload_config = UploadStreamer::select()
@@ -896,45 +1284,72 @@ pub async fn post_uploads(
                     StatusCode::BAD_REQUEST,
                     format!("无效或越界的媒体文件名: {file}"),
                 )
-                    .into_response()
             })
         })
-        .collect::<Result<Vec<_>, Response>>()?;
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(IntoResponse::into_response)?;
     if files.is_empty() {
         return Err((StatusCode::BAD_REQUEST, "至少选择一个媒体文件").into_response());
     }
     info!("通过页面开始上传");
+    let guard = observations.register(NewTask {
+        source: "manual",
+        scheduler_group: "manual",
+        title: upload_config
+            .title
+            .as_deref()
+            .unwrap_or(&upload_config.template_name),
+        streamer_name: None,
+        session_id: None,
+        template_name: Some(&upload_config.template_name),
+        fifo: false,
+    });
+    let task_id = guard.observation().id().to_owned();
+    let mut queued_files = Vec::with_capacity(files.len());
+    for file in &files {
+        queued_files.push((
+            file.file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            fs::metadata(file).await.ok().map(|metadata| metadata.len()),
+        ));
+    }
+    guard.observation().prepare_files(queued_files);
     tokio::spawn(async move {
-        let result = async {
-            let (bilibili, videos) = upload(
-                upload_config
-                    .user_cookie
-                    .as_deref()
-                    .unwrap_or("cookies.json"),
-                None,
-                line,
-                &files,
-                limit as usize,
-            )
-            .await?;
-            if !videos.is_empty() {
-                let recorder = Recorder::new(
-                    upload_config.title.clone(),
-                    StreamerInfo::new(
-                        &upload_config.template_name,
-                        "stream_title",
-                        "",
-                        Utc::now(),
-                        "",
-                    ),
-                );
-                let studio = build_studio(&upload_config, &bilibili, videos, &recorder).await?;
-                submit_to_bilibili(&bilibili, &studio, submit_api.as_deref()).await?;
-                info!(template_id = upload_config.id, "通过页面上传成功");
-            }
-            Ok::<_, Report<AppError>>(())
-        }
-        .await;
+        let result = guard
+            .scope(async {
+                guard.observation().phase("initializing");
+                let (bilibili, videos) = upload(
+                    upload_config
+                        .user_cookie
+                        .as_deref()
+                        .unwrap_or("cookies.json"),
+                    None,
+                    line,
+                    &files,
+                    limit as usize,
+                )
+                .await?;
+                if !videos.is_empty() {
+                    let recorder = Recorder::new(
+                        upload_config.title.clone(),
+                        StreamerInfo::new(
+                            &upload_config.template_name,
+                            "stream_title",
+                            "",
+                            Utc::now(),
+                            "",
+                        ),
+                    );
+                    let studio = build_studio(&upload_config, &bilibili, videos, &recorder).await?;
+                    guard.observation().title(&studio.title);
+                    submit_to_bilibili(&bilibili, &studio, submit_api.as_deref()).await?;
+                    info!(template_id = upload_config.id, "通过页面上传成功");
+                }
+                Ok::<_, Report<AppError>>(())
+            })
+            .await;
+        guard.finish_result(&result);
         if result.is_err() {
             // Upload failures can wrap upstream response bodies containing
             // short-lived upload authorization. Keep persistent Web logs free
@@ -943,7 +1358,7 @@ pub async fn post_uploads(
         }
     });
 
-    Ok(Json(serde_json::json!({})))
+    Ok(Json(serde_json::json!({ "task_id": task_id })))
 }
 
 #[cfg(test)]
@@ -951,7 +1366,76 @@ mod recording_policy_status_tests {
     use super::*;
     use crate::server::infrastructure::connection_pool::ConnectionManager;
     use chrono::{Duration as ChronoDuration, SecondsFormat};
+    use ormlite::Insert;
     use serde_json::Value;
+
+    #[tokio::test]
+    async fn manual_upload_registers_files_and_reports_initialization_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = ConnectionManager::new_pool(dir.path().join("data.sqlite3").to_str().unwrap())
+            .await
+            .unwrap();
+        let template: InsertUploadStreamer = serde_json::from_value(json!({
+            "template_name": "手动模板",
+            "title": "手动任务",
+            "user_cookie": dir.path().join("missing-cookie.json"),
+            "tags": []
+        }))
+        .unwrap();
+        let template = ormlite::Insert::insert(template, &pool).await.unwrap();
+        let media = tempfile::Builder::new()
+            .prefix(".manual-upload-observation-")
+            .suffix(".flv")
+            .tempfile_in(std::env::current_dir().unwrap())
+            .unwrap();
+        std::fs::write(media.path(), b"test media").unwrap();
+        let file_name = media
+            .path()
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let observations = UploadObservations::new(pool.clone());
+        observations.initialize().await.unwrap();
+        let Json(response) = post_uploads(
+            State(Arc::new(RwLock::new(Config::default()))),
+            State(pool),
+            State(observations.clone()),
+            Json(PostUploads {
+                files: vec![file_name.clone()],
+                template_id: template.id,
+            }),
+        )
+        .await
+        .unwrap();
+        let id = response["task_id"].as_str().unwrap();
+        let detail = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let detail = observations.detail(id).await.unwrap().unwrap();
+                if detail.task.state == "failed" {
+                    break detail;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(detail.task.source, "manual");
+        assert_eq!(detail.task.scheduler_group, "manual");
+        assert_eq!(detail.task.queue_position, None);
+        assert_eq!(detail.task.title, "手动任务");
+        assert_eq!(detail.task.bytes_confirmed, 0);
+        assert_eq!(detail.task.total_bytes, Some(10));
+        assert_eq!(detail.files.len(), 1);
+        assert_eq!(detail.files[0].name, file_name);
+        assert!(
+            !detail
+                .task
+                .error
+                .unwrap()
+                .contains(dir.path().to_str().unwrap())
+        );
+    }
 
     /// 以当前时刻为基准造窗口，形态与前端 `Date.toISOString()` 写出的一致
     fn window(starts_in: i64, ends_in: i64) -> String {
@@ -989,6 +1473,27 @@ mod recording_policy_status_tests {
         )
     }
 
+    #[tokio::test]
+    async fn recording_history_excludes_virtual_session_groups() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = ConnectionManager::new_pool(dir.path().join("data.sqlite3").to_str().unwrap())
+            .await
+            .unwrap();
+        for (id, kind) in [(1, "source"), (2, "group")] {
+            sqlx::query("INSERT INTO stream_sessions(id,name,url,title,date,live_cover_path,kind) VALUES(?, '主播', 'https://example.com/1', '直播', ?, '', ?)")
+                .bind(id)
+                .bind(Utc::now())
+                .bind(kind)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+
+        let Json(history) = get_streamer_info(State(pool)).await.unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].info.id, 1);
+    }
+
     /// 走完整的 数据库 -> /v1/streamers 处理函数 -> JSON 这条路
     #[tokio::test]
     async fn the_streamers_endpoint_reports_why_a_streamer_is_not_recording() {
@@ -1015,10 +1520,14 @@ mod recording_policy_status_tests {
             .unwrap();
 
         let managers = Arc::new(DownloadManager::new(1, 0, pool.clone()));
-        let Json(responses) =
-            get_streamers_endpoint(Caller::unrestricted(), State(pool), State(managers))
-                .await
-                .expect("接口应返回成功");
+        let Json(responses) = get_streamers_endpoint(
+            Caller::unrestricted(),
+            State(pool),
+            State(managers),
+            State(Default::default()),
+        )
+        .await
+        .expect("接口应返回成功");
 
         let status_of = |url: &str| {
             responses
@@ -1050,10 +1559,14 @@ mod recording_policy_status_tests {
             .unwrap();
 
         let managers = Arc::new(DownloadManager::new(1, 0, pool.clone()));
-        let Json(responses) =
-            get_streamers_endpoint(Caller::unrestricted(), State(pool), State(managers))
-                .await
-                .unwrap();
+        let Json(responses) = get_streamers_endpoint(
+            Caller::unrestricted(),
+            State(pool),
+            State(managers),
+            State(Default::default()),
+        )
+        .await
+        .unwrap();
 
         // 前端 app/(app)/streamers/page.tsx 就是对这个字符串做 switch
         let json: Value = serde_json::to_value(&responses[0]).unwrap();
@@ -1121,5 +1634,113 @@ mod recording_policy_status_tests {
             rejection_status(&streamer, Some(&worker)),
             Some("OutOfSchedule")
         );
+    }
+}
+
+#[cfg(test)]
+mod configuration_tests {
+    use super::*;
+    use crate::server::infrastructure::connection_pool::ConnectionManager;
+    use tracing_subscriber::{EnvFilter, reload};
+
+    #[test]
+    fn streamer_mosaic_save_rejects_invalid_configuration() {
+        let invalid = serde_json::from_value(serde_json::json!({
+            "mosaic_config": {"enabled": true, "regions": []}
+        }))
+        .unwrap();
+        assert_eq!(
+            validate_streamer_mosaic(&Some(invalid)).unwrap_err().0,
+            StatusCode::BAD_REQUEST
+        );
+        assert!(validate_streamer_mosaic(&None).is_ok());
+        let disabled = serde_json::from_value(serde_json::json!({
+            "mosaic_config": {"enabled": false, "regions": []}
+        }))
+        .unwrap();
+        assert!(validate_streamer_mosaic(&Some(disabled)).is_ok());
+    }
+
+    /// Web 界面保存配置后，下载池 / 上传池容量立即换成新值，不需要重启
+    #[tokio::test]
+    async fn saving_the_configuration_resizes_the_pools_immediately() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("data.sqlite3");
+        let pool = ConnectionManager::new_pool(db.to_str().unwrap())
+            .await
+            .unwrap();
+        let config = Arc::new(RwLock::new(Config::default()));
+        let managers = Arc::new(DownloadManager::new(
+            config.read().unwrap().pool1_size,
+            config.read().unwrap().pool2_size,
+            pool.clone(),
+        ));
+        let (_layer, log_handle) = reload::Layer::new(EnvFilter::new("info"));
+
+        let edited = Config {
+            pool1_size: 8,
+            pool2_size: 1,
+            ..Config::default()
+        };
+        let Json(saved) = put_configuration(
+            State(config.clone()),
+            State(pool),
+            State(managers.clone()),
+            State(log_handle),
+            Json(edited),
+        )
+        .await
+        .expect("保存配置应成功");
+
+        assert_eq!(saved.pool1_size, 8);
+        assert_eq!(config.read().unwrap().pool2_size, 1);
+        assert_eq!(managers.download_pool_size(), 8);
+        assert_eq!(managers.upload_pool_size(), 1);
+    }
+
+    /// 池大小填 0 保存会被拒（400），配置与池容量都不变
+    #[tokio::test]
+    async fn a_zero_pool_size_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("data.sqlite3");
+        let pool = ConnectionManager::new_pool(db.to_str().unwrap())
+            .await
+            .unwrap();
+        let config = Arc::new(RwLock::new(Config::default()));
+        let managers = Arc::new(DownloadManager::new(
+            config.read().unwrap().pool1_size,
+            config.read().unwrap().pool2_size,
+            pool.clone(),
+        ));
+        let (_layer, log_handle) = reload::Layer::new(EnvFilter::new("info"));
+        let before = (managers.download_pool_size(), managers.upload_pool_size());
+
+        for edited in [
+            Config {
+                pool1_size: 0,
+                ..Config::default()
+            },
+            Config {
+                pool2_size: 0,
+                ..Config::default()
+            },
+        ] {
+            let response = put_configuration(
+                State(config.clone()),
+                State(pool.clone()),
+                State(managers.clone()),
+                State(log_handle.clone()),
+                Json(edited),
+            )
+            .await
+            .expect_err("池大小为 0 应被拒");
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
+        assert_eq!(
+            (managers.download_pool_size(), managers.upload_pool_size()),
+            before
+        );
+        let saved = config.read().unwrap();
+        assert!(saved.pool1_size > 0 && saved.pool2_size > 0);
     }
 }

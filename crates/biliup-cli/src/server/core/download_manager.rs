@@ -1,13 +1,16 @@
 use crate::server::common::upload::UActor;
+use crate::server::common::upload_observation::UploadObservations;
 use crate::server::core::monitor::Monitor;
+use crate::server::core::slots::Slots;
+use crate::server::errors::{AppError, AppResult};
 use crate::server::infrastructure::connection_pool::ConnectionPool;
 use crate::server::infrastructure::context::{Stage, Worker, WorkerStatus};
 use async_channel::bounded;
 use biliup::downloader::live::LivePlugin;
+use error_stack::ResultExt;
 use std::sync::Arc;
-use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
-use tracing::info;
+use tracing::{error, info};
 
 /// 下载管理器
 /// 负责管理特定平台的下载任务，包括监控器和插件
@@ -15,41 +18,85 @@ pub struct DownloadManager {
     /// 下载插件
     // plugins: Vec<Arc<dyn LivePlugin + Send + Sync>>,
     rooms_handle: Arc<Monitor>,
+    pool: ConnectionPool,
 
-    /// 下载池大小。真正的并发控制由 Monitor 持有的 Semaphore 完成。
-    pub download_semaphore: u32,
-    /// 上传Actor任务句柄列表
-    pub(crate) u_kills: Vec<JoinHandle<()>>,
+    /// 下载池（pool1_size）：同时录制的直播间上限，由 Monitor 在检测开播前占用。
+    download_slots: Arc<Slots>,
+    /// 上传池（pool2_size）：同时进行的上传流程上限，由上传Actor在处理每条消息前占用。
+    upload_slots: Arc<Slots>,
+    /// 上传Actor任务句柄
+    u_kill: JoinHandle<()>,
+    observations: Arc<UploadObservations>,
 }
 
 impl DownloadManager {
     /// 创建新的下载管理器实例
     ///
     /// # 参数
-    /// * `plugin` - 下载插件实现
-    /// * `actor_handle` - Actor处理器
-    pub fn new(download_semaphore: u32, update_semaphore: u32, pool: ConnectionPool) -> Self {
+    /// * `pool1_size` - 下载池容量
+    /// * `pool2_size` - 上传池容量
+    /// * `pool` - 数据库连接池
+    pub fn new(pool1_size: u32, pool2_size: u32, pool: ConnectionPool) -> Self {
+        let observations = UploadObservations::new(pool.clone());
         // 创建消息通道
         let (up_tx, up_rx) = bounded(16);
-        let mut u_kills = Vec::new();
+        let download_slots = Arc::new(Slots::new(pool1_size as usize));
+        let upload_slots = Arc::new(Slots::new(pool2_size as usize));
 
-        let rooms_handle = Arc::new(Monitor::new(
-            up_tx.clone(),
-            Arc::new(Semaphore::new(download_semaphore as usize)),
-            pool.clone(),
-        ));
+        let rooms_handle = Arc::new(Monitor::new(up_tx, download_slots.clone(), pool.clone()));
         // 创建上传Actor
-        for _ in 0..update_semaphore {
-            let mut u_actor = UActor::new(up_rx.clone());
-            let u_kill = tokio::spawn(async move { u_actor.run().await });
-            u_kills.push(u_kill)
-        }
+        let u_actor = UActor::new(up_rx, upload_slots.clone());
+        let u_kill = tokio::spawn(u_actor.run());
 
         Self {
-            download_semaphore,
-            u_kills,
             rooms_handle,
+            pool,
+            download_slots,
+            upload_slots,
+            u_kill,
+            observations,
         }
+    }
+
+    /// 按新配置调整下载池 / 上传池容量，立即生效。
+    ///
+    /// 调小不会打断正在进行的录制和上传，占用数降到新容量以下后才会开始新的任务。
+    pub fn resize_pools(&self, pool1_size: u32, pool2_size: u32) {
+        self.download_slots.resize(pool1_size as usize);
+        self.upload_slots.resize(pool2_size as usize);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_probe_gate(&self, gate: Arc<tokio::sync::Semaphore>) {
+        self.rooms_handle.set_probe_gate(gate);
+    }
+
+    /// 下载池当前容量
+    pub fn download_pool_size(&self) -> usize {
+        self.download_slots.capacity()
+    }
+
+    /// 上传池当前容量
+    pub fn upload_pool_size(&self) -> usize {
+        self.upload_slots.capacity()
+    }
+
+    /// 下载池当前占用
+    pub fn download_pool_occupied(&self) -> usize {
+        self.download_slots.occupied()
+    }
+
+    /// 上传池当前占用
+    pub fn upload_pool_occupied(&self) -> usize {
+        self.upload_slots.occupied()
+    }
+
+    /// 上传池本身：一主一备的备机录完后才投的场次也占它的槽位
+    pub(crate) fn upload_slots(&self) -> Arc<Slots> {
+        self.upload_slots.clone()
+    }
+    pub(crate) fn upload_observations(&self) -> Arc<UploadObservations> {
+        self.observations.clone()
     }
 
     pub async fn add_plugin(&self, plugin: Arc<dyn LivePlugin + Send + Sync>) {
@@ -59,9 +106,38 @@ impl DownloadManager {
     }
 
     pub async fn add_room(&self, worker: Worker) -> Option<()> {
+        // 在加入检测队列之前恢复暂停，避免重启时短暂开录。
+        match sqlx::query_scalar::<_, bool>(
+            "SELECT recording_paused FROM livestreamers WHERE id = ?",
+        )
+        .bind(worker.id())
+        .fetch_optional(&self.pool)
+        .await
+        {
+            Ok(Some(true)) => {
+                worker
+                    .change_status(Stage::Download, WorkerStatus::Pause)
+                    .await
+            }
+            Ok(_) => {}
+            Err(error) => {
+                error!(id = worker.id(), %error, "读取录制暂停状态失败，未加入监控");
+                return None;
+            }
+        }
         let arc = Arc::new(worker);
         self.rooms_handle.add(arc.clone()).await?;
         Some(())
+    }
+
+    pub(crate) async fn persist_pause(&self, id: i64, paused: bool) -> AppResult<()> {
+        sqlx::query("UPDATE livestreamers SET recording_paused = ? WHERE id = ?")
+            .bind(paused)
+            .bind(id)
+            .execute(&self.pool)
+            .await
+            .change_context(AppError::Custom("保存录制暂停状态失败".into()))?;
+        Ok(())
     }
 
     pub async fn del_room(&self, id: i64) {
@@ -79,6 +155,11 @@ impl DownloadManager {
 
     pub async fn wake_waker(&self, id: i64) {
         self.rooms_handle.wake_waker(id).await;
+    }
+
+    /// 手动恢复时优先检测该房间，并立即唤醒平台监控循环。
+    pub async fn resume_room(&self, id: i64) {
+        self.rooms_handle.resume_room(id).await;
     }
 
     pub async fn get_room_by_id(&self, id: i64) -> Option<Arc<Worker>> {
@@ -108,9 +189,8 @@ impl DownloadManager {
 
 impl Drop for DownloadManager {
     fn drop(&mut self) {
-        for h in &self.u_kills {
-            h.abort();
-        }
+        // 上传Actor的在途上传任务在它的 JoinSet 里，随它一起取消
+        self.u_kill.abort();
         info!("exit download manager");
     }
 }

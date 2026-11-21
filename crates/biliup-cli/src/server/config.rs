@@ -1,7 +1,7 @@
+use crate::server::auto_clip::settings::AutoClipConfig;
 use crate::server::core::downloader::DownloaderType;
 use crate::server::errors::{AppError, AppResult};
 use crate::server::infrastructure::models::hook_step::HookStep;
-use biliup::bilibili::Credit;
 use error_stack::{ResultExt, bail};
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, fs, path::Path, path::PathBuf};
@@ -37,6 +37,20 @@ pub struct Config {
     #[serde(default)]
     pub ffmpeg_path: Option<String>,
 
+    /// 弹幕字体目录：浏览器预览与合成（FFmpeg/libass）共用这里的字体。不填时用随包的
+    /// Noto Sans CJK SC 与 Noto Emoji。填目录本身或它下面的 `fonts/` 都可以。
+    #[patch(skip)]
+    #[serde(default)]
+    pub render_fonts_dir: Option<String>,
+
+    /// Legacy, ignored: XML to ASS conversion is built into biliup and no
+    /// longer runs a DanmakuFactory executable. Still read so that existing
+    /// configurations load; a non-empty value only logs a warning, and it is
+    /// not written back when unset.
+    #[patch(skip)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub danmaku_factory_path: Option<String>,
+
     /// 文件大小限制（字节）
     ///
     /// 主播覆写里这个字段的 `null` 是“显式清除、按主播关闭大小分段”，与其它字段不同。
@@ -51,7 +65,13 @@ pub struct Config {
     #[serde(default = "default_file_size")]
     pub file_size: Option<u64>,
 
-    /// 分段时间，格式如 "00:00:00"，保留为字符串以保持直观
+    /// 分段时间：[HH:]MM:SS[.小数] 或秒数，保留字符串以保持直观。
+    /// 主播补丁缺少此键时继承全局，显式 null 关闭时长分段。
+    #[patch(attribute(serde(
+        default,
+        deserialize_with = "deserialize_option_patch",
+        skip_serializing_if = "Option::is_none"
+    )))]
     #[serde(default)]
     pub segment_time: Option<String>,
 
@@ -72,7 +92,7 @@ pub struct Config {
     #[serde(default)]
     pub uploader: Option<String>,
 
-    /// 提交API类型：web | client
+    /// 投稿接口：web（默认）| app | b-cut-android
     #[serde(default)]
     pub submit_api: Option<String>,
 
@@ -85,6 +105,12 @@ pub struct Config {
     #[builder(default = default_threads())]
     #[serde(default = "default_threads")]
     pub threads: u32,
+
+    /// 同一分段因网络故障（断网、DNS 解析失败、超时、5xx）上传失败时最多上传几次，含第一次；
+    /// 两次之间从 30 秒起翻倍等待，最长 5 分钟。不填为 6 次，0 与 1 都是不重试。
+    /// B 站限流、风控等拒绝不重试；次数用完仍失败就跳过该分段，文件留在本地。
+    #[serde(default)]
+    pub max_upload_limit: Option<u32>,
 
     /// 延迟时间（秒）
     #[builder(default = default_delay())]
@@ -111,11 +137,49 @@ pub struct Config {
     #[serde(default = "default_pool2_size")]
     pub pool2_size: u32,
 
+    /// 同一主播下播后多少分钟内再开播，接着记在上一场（直播历史里算一场，断流记在切片工作台
+    /// 的时间轴上）；0 = 不合并。投稿不受影响：断流后重新开始的录制仍单独投稿。
+    #[builder(default = default_live_merge_minutes())]
+    #[serde(default = "default_live_merge_minutes")]
+    pub live_merge_minutes: u64,
+
+    /// 投稿后保留录像的小时数：后处理 `rm`、边录边传投稿后删除临时文件时，录像先留这么久，
+    /// 到期后由每分钟一次的清理任务删除。0（默认）= 立即删除，与以前一样。
+    /// 被切片工作台引用、或所在场次设了「保留这场」的分段，不论这里怎么设都会等引用释放后再删。
+    #[builder(default)]
+    #[serde(default)]
+    pub retention_hours: u64,
+
+    /// 录像所在磁盘的最低可用空间（字节）：低于它时，每分钟一次按「没被引用的最旧 → 被引用的最旧」
+    /// 删已录完的分段，直到回到阈值以上。只删切片工作台记录过的分段，不删正在录的。
+    /// 空或 0（默认）= 不启用。
+    #[serde(default)]
+    pub min_free_space: Option<u64>,
+
     /// 直播预览的取流方式：`relay`（默认，复用正在录制的那一路、经 biliup 中转，不多拉 CDN）
     /// 或 `direct`（浏览器直接向 CDN 拉一路，省服务器带宽；平台不支持时自动回落中转）。
     /// `None` 视同 `relay`。
     #[serde(default)]
     pub preview_transport: Option<PreviewTransport>,
+
+    /// 单条中转预览连接最长持续多少分钟，到点结束响应，播放器自动重连。服务端看不出客户端是否
+    /// 还在看（经过会替客户端读完上游的代理 / 隧道时，关掉播放器 TCP 也不断），这是回收这类
+    /// 「幽灵连接」的兜底。空 = 默认 30 分钟；0 = 不限。只认全局配置。
+    #[patch(skip)]
+    #[serde(default)]
+    pub preview_max_minutes: Option<u64>,
+
+    /// 自动切片（实验）：OpenAI 兼容的 chat / 转写接口。没配置时不序列化，与以前的配置完全一样。
+    /// 只认全局配置；接口只回显 key 的掩码，见 [`crate::server::auto_clip::settings`]。
+    #[patch(skip)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_clip: Option<AutoClipConfig>,
+
+    /// 自动切片：这个主播下播（过了断流合并窗口）后自动生成候选。只认主播覆写，全局配置里写了
+    /// 不生效（按主播开，免得每一场都花钱）；还要全局 `auto_clip.enabled` 打开才会跑。
+    #[patch(attribute(serde(skip_serializing_if = "Option::is_none")))]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_clip_after_live: Option<bool>,
 
     // ===== 各平台录播设置 =====
     /// 是否使用直播封面
@@ -135,6 +199,25 @@ pub struct Config {
     /// 斗鱼码率
     #[serde(default)]
     pub douyu_rate: Option<u32>,
+    /// 用户 Cookie 中 acf_did 的值
+    #[serde(default, rename = "douyu_deviceId", alias = "douyu_device_id")]
+    pub douyu_device_id: Option<String>,
+    /// 斗鱼网页版登录 Cookie（请求头字符串或浏览器 JSON 导出）。部分房间的原画需要登录。
+    /// 属于账号凭据：不在 `VISIBLE_CONFIG_KEYS` 里，非超管看不到，Fleet 也不下发
+    #[serde(default)]
+    pub douyu_cookie: Option<String>,
+    /// 斗鱼 passport 长期续期凭据 LTP0；仅本机保存，不下发到 Fleet。
+    #[serde(default)]
+    pub douyu_ltp0: Option<String>,
+    /// 续期时使用的斗鱼 Web 设备号（dy_did）。不填时从 Cookie / 导出 JSON 读取。
+    #[serde(default)]
+    pub douyu_refresh_device_id: Option<String>,
+    /// 是否自动续期斗鱼 Web 登录 Cookie；有 LTP0 时默认开启。
+    #[serde(default)]
+    pub douyu_auto_refresh: Option<bool>,
+    /// 斗鱼视频编码：AVC 或 HEVC
+    #[serde(default)]
+    pub douyu_codec: Option<String>,
     /// 斗鱼互动游戏运行时跳过录制
     #[serde(default)]
     pub douyu_disable_interactive_game: Option<bool>,
@@ -298,6 +381,38 @@ pub struct Config {
     pub user: Option<UserConfig>,
 
     pub loggers_level: Option<String>,
+
+    /// 马赛克配置（画面遮挡功能）
+    #[patch(attribute(serde(skip_serializing_if = "Option::is_none")))]
+    #[serde(default)]
+    pub mosaic_config: Option<serde_json::Value>,
+}
+
+/// 投稿模板 `credits` 的一项：简介里的一个 `@credit` 换成 @ 这个用户。
+///
+/// 与 Web 表单存进 `uploadstreamers.credits` 的形状相同；表单存的 uid 是字符串，
+/// 配置文件里通常写成数字，两种都接受，统一存成字符串。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TemplateCredit {
+    pub username: String,
+    #[serde(deserialize_with = "uid_from_number_or_string")]
+    pub uid: String,
+}
+
+fn uid_from_number_or_string<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Uid {
+        Number(u64),
+        Text(String),
+    }
+    Ok(match Uid::deserialize(deserializer)? {
+        Uid::Number(n) => n.to_string(),
+        Uid::Text(s) => s,
+    })
 }
 
 /// 主播配置结构体
@@ -334,8 +449,9 @@ pub struct StreamerConfig {
     #[serde(default)]
     pub description: Option<String>,
 
+    /// 简介里 `@credit` 占位符依次替换成的用户
     #[serde(default)]
-    pub credits: Option<Vec<Credit>>,
+    pub credits: Option<Vec<TemplateCredit>>,
 
     #[serde(default)]
     pub dynamic: Option<String>,
@@ -527,24 +643,86 @@ fn default_pool2_size() -> u32 {
     3
 }
 
+/// 默认断流合并窗口：10 分钟
+fn default_live_merge_minutes() -> u64 {
+    10
+}
+
 impl Default for Config {
     fn default() -> Self {
         serde_json::from_value(serde_json::json!({})).expect("default config should deserialize")
     }
 }
 
+/// [`Config::preview_max_minutes`] 不填时的默认值。
+pub const DEFAULT_PREVIEW_MAX_MINUTES: u64 = 30;
+
 impl Config {
+    /// Validate new masking settings before persisting. The processor also checks
+    /// imported/legacy settings so invalid config never bypasses masking.
+    pub fn validate_mosaic(&self) -> Result<(), String> {
+        let Some(value) = &self.mosaic_config else {
+            return Ok(());
+        };
+        let mosaic: crate::server::common::processing::masking::MosaicConfig =
+            serde_json::from_value(value.clone())
+                .map_err(|_| "画面遮挡配置格式错误".to_string())?;
+        mosaic.validate()
+    }
+    /// 单条中转预览连接的最长寿命，`None` 为不限，见 [`Config::preview_max_minutes`]。
+    pub fn preview_max_lifetime(&self) -> Option<std::time::Duration> {
+        match self
+            .preview_max_minutes
+            .unwrap_or(DEFAULT_PREVIEW_MAX_MINUTES)
+        {
+            0 => None,
+            minutes => Some(std::time::Duration::from_secs(minutes.saturating_mul(60))),
+        }
+    }
+
     pub fn validate_segment_limits(&self) -> AppResult<()> {
+        if let Some(value) = self
+            .segment_time
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+        {
+            let duration = crate::server::common::util::parse_segment_time(value);
+            if duration.is_none_or(|duration| duration.is_zero()) {
+                bail!(AppError::Custom(
+                    "视频分段时长（segment_time）必须为大于 0 的时:分:秒、分:秒或秒数，例如 00:07:30、7:30、450；关闭时长分段请清空此字段".to_string()
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// 下载池 / 上传池至少为 1：保存即生效，0 会让新录制 / 上传静默地再也不开始
+    pub fn validate_pool_sizes(&self) -> Result<(), String> {
+        if self.pool1_size == 0 {
+            return Err("下载线程池大小（pool1_size）至少为 1".to_string());
+        }
+        if self.pool2_size == 0 {
+            return Err("上传线程池大小（pool2_size）至少为 1".to_string());
+        }
         Ok(())
     }
 
     pub fn normalize_segment_limits(&mut self) {
-        if self
-            .segment_time
-            .as_deref()
-            .is_some_and(|value| value.trim().is_empty())
-        {
-            self.segment_time = None;
+        if let Some(value) = self.segment_time.as_deref() {
+            let trimmed = value.trim();
+            // Older configs used zero to disable the limit. Keep that behavior on upgrade,
+            // but do not turn a positive value smaller than the recorder's precision into zero.
+            let legacy_zero = crate::server::common::util::parse_segment_time(trimmed)
+                .is_some_and(|duration| duration.is_zero())
+                && trimmed
+                    .bytes()
+                    .filter(u8::is_ascii_digit)
+                    .all(|byte| byte == b'0');
+            self.segment_time = if trimmed.is_empty() || legacy_zero {
+                None
+            } else {
+                Some(trimmed.to_string())
+            };
         }
     }
 
@@ -588,6 +766,20 @@ mod tests {
         assert_eq!(config.file_size, default_file_size());
         assert_eq!(config.segment_time, None);
         assert!(config.validate_segment_limits().is_ok());
+    }
+
+    #[test]
+    fn legacy_danmaku_factory_path_still_loads_but_is_not_written_when_unset() {
+        let config: Config =
+            serde_json::from_str(r#"{"danmaku_factory_path": "/opt/DanmakuFactory"}"#).unwrap();
+        assert_eq!(
+            config.danmaku_factory_path.as_deref(),
+            Some("/opt/DanmakuFactory")
+        );
+        let config: Config = serde_yaml::from_str("danmaku_factory_path: null\n").unwrap();
+        assert_eq!(config.danmaku_factory_path, None);
+        let saved = serde_json::to_value(Config::default()).unwrap();
+        assert!(saved.get("danmaku_factory_path").is_none(), "{saved}");
     }
 
     #[test]
@@ -695,6 +887,161 @@ mod tests {
     }
 
     #[test]
+    fn custom_segment_times_and_legacy_disabled_values_normalize_and_validate() {
+        for value in ["00:07:30", "7:30", "450", " 00:07:30.5 ", "0.001"] {
+            let mut config = Config {
+                segment_time: Some(value.to_string()),
+                ..Config::default()
+            };
+            config.normalize_segment_limits();
+            assert!(config.validate_segment_limits().is_ok(), "{value}");
+            assert_eq!(config.segment_time.as_deref(), Some(value.trim()));
+        }
+        for value in ["", " ", "0", "0.0", "00:00:00", "00:00:00.000"] {
+            let mut config = Config {
+                segment_time: Some(value.to_string()),
+                ..Config::default()
+            };
+            config.normalize_segment_limits();
+            assert_eq!(config.segment_time, None, "{value}");
+            assert!(config.validate_segment_limits().is_ok());
+        }
+        for value in [
+            "abc",
+            "7:60",
+            "90:00",
+            "-450",
+            "NaN",
+            "1e3",
+            "0.0000000001",
+            "999999999999999999999:00:00",
+        ] {
+            let mut config = Config {
+                segment_time: Some(value.to_string()),
+                ..Config::default()
+            };
+            config.normalize_segment_limits();
+            assert!(config.validate_segment_limits().is_err(), "{value}");
+        }
+    }
+
+    #[test]
+    fn custom_segment_time_patch_round_trips_and_distinguishes_inheritance_from_disabled() {
+        let global_time = "00:30:00";
+        for raw in [
+            r#"{"downloader":"mesio"}"#,
+            r#"{"segment_time":null}"#,
+            r#"{"segment_time":"00:07:30"}"#,
+        ] {
+            let patch: ConfigPatch = serde_json::from_str(raw).unwrap();
+            let stored = serde_json::to_value(patch).unwrap();
+            let submitted: serde_json::Value = serde_json::from_str(raw).unwrap();
+            assert_eq!(stored.get("segment_time"), submitted.get("segment_time"));
+            let reloaded: ConfigPatch = serde_json::from_value(stored).unwrap();
+            let mut config = Config {
+                segment_time: Some(global_time.to_string()),
+                ..Config::default()
+            };
+            config.apply(reloaded);
+            let expected = match submitted.get("segment_time") {
+                None => Some(global_time),
+                Some(serde_json::Value::Null) => None,
+                Some(value) => value.as_str(),
+            };
+            assert_eq!(config.segment_time.as_deref(), expected, "{raw}");
+            assert!(config.validate_segment_limits().is_ok());
+        }
+    }
+
+    #[tokio::test]
+    async fn segment_time_migration_removes_legacy_null_and_preserves_custom_duration() {
+        // The cleanup is part of the schema migration, so the database has to
+        // start at the schema from before it and bring the legacy rows along.
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        let mut through_14 = sqlx::migrate!();
+        through_14.migrations = through_14
+            .migrations
+            .iter()
+            .filter(|migration| migration.version <= 14)
+            .cloned()
+            .collect::<Vec<_>>()
+            .into();
+        through_14.run(&pool).await.unwrap();
+        for (id, value) in [
+            (
+                1,
+                r#"{"segment_time":null,"downloader":"mesio","file_size":123}"#,
+            ),
+            (2, r#"{"segment_time":"00:07:30","file_size":456}"#),
+            (3, r#"{"downloader":"ffmpeg"}"#),
+        ] {
+            sqlx::query(
+                "INSERT INTO livestreamers (id, url, remark, \"override\") VALUES (?, ?, ?, ?)",
+            )
+            .bind(id)
+            .bind(format!("https://live.bilibili.com/{id}"))
+            .bind(format!("streamer-{id}"))
+            .bind(value)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        // Still the same in-memory database, still at the pre-squash schema:
+        // the full migrator now applies the merged migration to it.
+        sqlx::migrate!().run(&pool).await.unwrap();
+        let rows: Vec<String> =
+            sqlx::query_scalar("SELECT override FROM livestreamers ORDER BY id")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        let values: Vec<serde_json::Value> = rows
+            .iter()
+            .map(|raw| serde_json::from_str(raw).unwrap())
+            .collect();
+        assert!(values[0].get("segment_time").is_none());
+        assert_eq!(values[0]["downloader"], "mesio");
+        assert_eq!(values[0]["file_size"], 123);
+        assert_eq!(values[1]["segment_time"], "00:07:30");
+        assert_eq!(values[1]["file_size"], 456);
+        assert_eq!(values[2], serde_json::json!({"downloader":"ffmpeg"}));
+        let patch: ConfigPatch = serde_json::from_str(&rows[0]).unwrap();
+        let mut config = Config {
+            segment_time: Some("01:00:00".into()),
+            ..Config::default()
+        };
+        config.apply(patch);
+        assert_eq!(config.segment_time.as_deref(), Some("01:00:00"));
+        sqlx::query("CREATE TABLE fleet_rooms AS SELECT * FROM livestreamers")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE fleet_rooms SET override = ? WHERE id = 1")
+            .bind(r#"{"segment_time":null,"downloader":"mesio"}"#)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::raw_sql(include_str!(
+            "../../fleet_migrations/7_override_segment_time_placeholder_null.sql"
+        ))
+        .execute(&pool)
+        .await
+        .unwrap();
+        let fleet: String = sqlx::query_scalar("SELECT override FROM fleet_rooms WHERE id = 1")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&fleet).unwrap(),
+            serde_json::json!({"downloader":"mesio"})
+        );
+        pool.close().await;
+    }
+
+    #[test]
     fn streamer_config_tid_v2_round_trip() {
         let raw = r#"{"url":["https://example.com"],"tid":95,"tid_v2":2102,"tags":["a"]}"#;
         let cfg: StreamerConfig = serde_json::from_str(raw).unwrap();
@@ -711,6 +1058,66 @@ mod tests {
             serde_json::from_str(r#"{"url":["https://example.com"],"tid":171}"#).unwrap();
         assert_eq!(cfg.tid, Some(171));
         assert!(cfg.tid_v2.is_none());
+    }
+
+    fn credit(username: &str, uid: &str) -> TemplateCredit {
+        TemplateCredit {
+            username: username.into(),
+            uid: uid.into(),
+        }
+    }
+
+    #[test]
+    fn toml_streamer_credits_follow_documented_format() {
+        let config: Config = toml::from_str(
+            r#"
+[streamers."羊腿"]
+url = ["https://live.bilibili.com/1"]
+description = "@credit 直播回放"
+credits = [
+  { username = "羊腿umer", uid = 22158819 },
+  { username = "允崽来啦", uid = "2063092494" },
+]
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            config.streamers["羊腿"].credits,
+            Some(vec![
+                credit("羊腿umer", "22158819"),
+                credit("允崽来啦", "2063092494"),
+            ])
+        );
+    }
+
+    #[test]
+    fn yaml_streamer_credits_follow_documented_format() {
+        let config: Config = serde_yaml::from_str(
+            r#"
+streamers:
+  羊腿:
+    url: [https://live.bilibili.com/1]
+    credits:
+      - username: 羊腿umer
+        uid: 22158819
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            config.streamers["羊腿"].credits,
+            Some(vec![credit("羊腿umer", "22158819")])
+        );
+    }
+
+    #[test]
+    fn template_credit_round_trips_web_form_shape() {
+        let raw = r#"{"uid":"2063092494","username":"允崽来啦"}"#;
+        let parsed: TemplateCredit = serde_json::from_str(raw).unwrap();
+        assert_eq!(parsed, credit("允崽来啦", "2063092494"));
+        assert_eq!(
+            serde_json::to_value(&parsed).unwrap(),
+            serde_json::json!({"username": "允崽来啦", "uid": "2063092494"})
+        );
     }
 
     #[test]

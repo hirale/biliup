@@ -1,34 +1,32 @@
 'use client'
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import dynamic from 'next/dynamic'
-import { Button, Modal, Radio, RadioGroup, Switch, Tag, Toast, Tooltip, Typography } from '@douyinfe/semi-ui'
-import { IconChevronDown, IconPlay, IconRefresh } from '@douyinfe/semi-icons'
+import { useRouter } from 'next/navigation'
+import { Button, Tooltip } from '@douyinfe/semi-ui'
+import { IconPlay, IconRefresh } from '@douyinfe/semi-icons'
 import type { ButtonProps } from '@douyinfe/semi-ui/lib/es/button'
 import { LiveStreamerEntity, revalidateMe } from '@/app/lib/api-streamer'
-import { platformName } from '@/app/lib/status'
 import {
   canPreview,
   directPlayableUrl,
   fetchLiveUrl,
-  formatRate,
   liveImageUrl,
   livePreviewUrl,
   previewDisabledReason,
-  previewFormatLabel,
   usePreviewTransport,
 } from '@/app/lib/use-dashboard'
-import { useBoolPref, useEnumPref } from '@/app/lib/use-local-pref'
-import { type DanmakuFeed, useDanmakuFeed } from '@/app/lib/danmaku-feed'
+import { useEnumPref } from '@/app/lib/use-local-pref'
+import { relayLease } from '@/app/lib/preview-lease'
+import { holdPreviewLease } from '@/app/lib/use-live-rates'
+import type { DanmakuFeed } from '@/app/lib/danmaku-feed'
 import {
   type LatencyProfile,
   type LiveBufferPolicy,
   RELAY_PROFILES,
-  RELAY_PROFILES_SEGMENTED,
   relayPolicy,
   snapshotMsFor,
   type StallInfo,
 } from '@/app/lib/live-buffer'
-import { LiveRateChart, LiveRateSummary, MODAL_RATE_WINDOW_MS } from './LiveRateChart'
 import styles from './live-preview.module.scss'
 
 const Players = dynamic(() => import('@/app/ui/Player'), { ssr: false })
@@ -36,9 +34,12 @@ const Players = dynamic(() => import('@/app/ui/Player'), { ssr: false })
 /** 服务端断开（掉队 / 换直链）后自动重连的次数上限；超过后交给用户手动重试 */
 const MAX_AUTO_RECONNECT = 3
 const RECONNECT_DELAY_MS = 2000
-/** 弹层弹幕开关记在本地，默认开；监视器另有自己的开关（默认关） */
-const MODAL_DANMAKU_KEY = 'biliup.preview.danmaku'
-/** 中转延迟档位（弹层与监视器共用），默认低延迟；卡顿后本次播放自动升到流畅 */
+/**
+ * 一条连接播够这么久再断（比如到了服务端单连接的最长时长 preview_max_minutes），不算连续失败：
+ * 重连计数清零，长时间开着的预览不会在第 4 次到期时停下
+ */
+const RESET_ATTEMPTS_AFTER_MS = 60_000
+/** 中转延迟档位（预览页与监视器共用），默认低延迟；卡顿后本次播放自动升到流畅 */
 const LATENCY_PROFILE_KEY = 'biliup.preview.latency'
 const LATENCY_PROFILES: readonly LatencyProfile[] = ['low', 'smooth']
 /** 低延迟档下，稳态里一次卡住这么久、或 60 s 内卡两次，就升到流畅档重连 */
@@ -49,8 +50,6 @@ const ESCALATE_WINDOW_MS = 60_000
 export function useLatencyProfile(): [LatencyProfile, (v: LatencyProfile) => void] {
   return useEnumPref(LATENCY_PROFILE_KEY, LATENCY_PROFILES, 'low')
 }
-/** 弹层底部的码率折线默认展开，折叠状态记在本地 */
-const MODAL_RATE_CHART_KEY = 'biliup.preview.rateChart'
 
 type Phase = 'connecting' | 'playing' | 'reconnecting' | 'ended' | 'error'
 
@@ -73,7 +72,7 @@ type Source =
  *
  * 播放器（Artplayer + mpegts.js）挂在 `key={nonce}` 上，重连即换 key 重建；
  * 组件卸载时播放器销毁、fetch 中止，服务端随之释放该连接的槽位。
- * 既用于卡片弹层，也用于历史记录页的监视器小窗。
+ * 既用于直播预览页，也用于剪辑台页的监视器小窗。
  */
 export function LivePreviewPlayer({
   streamer,
@@ -95,7 +94,13 @@ export function LivePreviewPlayer({
   const [phase, setPhase] = useState<Phase>('connecting')
   const [message, setMessage] = useState<string | null>(null)
   const attemptsRef = useRef(0)
+  /** 当前连接开始播放的时刻；0 表示还没播起来 */
+  const playingSinceRef = useRef(0)
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const clearReconnectTimer = useCallback(() => {
+    if (timerRef.current !== null) clearTimeout(timerRef.current)
+    timerRef.current = null
+  }, [])
   const transport = usePreviewTransport()
   const directCapable = !!streamer.preview?.direct?.capable
   const directReason = streamer.preview?.direct?.reason ?? null
@@ -145,6 +150,9 @@ export function LivePreviewPlayer({
   const levelKey = `${streamer.id}:${profilePref}`
   const [escalated, setEscalated] = useState<string | null>(null)
   const level: LatencyProfile = escalated === levelKey ? 'smooth' : profilePref
+  // 自动重连的请求带 reconnect=1：服务端满员时回 429 而不去挤掉别人（被挤掉的页面若也去挤，
+  // 几个真在看的页面会轮流挤掉对方）。同样记 key，换房间 / 换档位就是新打开，自然作废
+  const [reconnectKey, setReconnectKey] = useState<string | null>(null)
   const policy: LiveBufferPolicy = relayPolicy(level, relayFormat)
   const stallsRef = useRef<number[]>([])
   const handleStall = useCallback(
@@ -154,16 +162,26 @@ export function LivePreviewPlayer({
       stallsRef.current = [...stallsRef.current.filter((t) => now - t < ESCALATE_WINDOW_MS), now]
       if (info.seconds < ESCALATE_STALL_S && stallsRef.current.length < 2) return
       stallsRef.current = []
+      clearReconnectTimer()
       setEscalated(levelKey)
+      setReconnectKey(null)
       setPhase('connecting')
       setMessage(null)
       setNonce((n) => n + 1)
     },
-    [level, levelKey]
+    [level, levelKey, clearReconnectTimer]
   )
 
+  // 中转流挂在本页面的租约上：码率连接是心跳（播放期间一直连着），播放器销毁时释放这条连接
+  const relay = source?.kind === 'relay'
+  useEffect(() => {
+    if (!relay) return
+    return holdPreviewLease()
+  }, [relay])
+  const lease = useMemo(() => (relay ? relayLease(streamer.id) : undefined), [relay, streamer.id])
+
   const codecs = streamer.preview?.codecs ?? null
-  const relayUrl = livePreviewUrl(streamer.id, snapshotMsFor(policy))
+  const relayUrl = livePreviewUrl(streamer.id, snapshotMsFor(policy), { reconnect: reconnectKey === levelKey })
   const url = source?.kind === 'direct' ? source.url : relayUrl
   const format = source?.kind === 'direct' ? (source.format ?? 'flv') : relayFormat
   // 平台有弹幕客户端才装弹幕层；开关只控制订阅与显示
@@ -173,17 +191,17 @@ export function LivePreviewPlayer({
   // 出错 / 断开时把封面垫在说明文字后面，而不是一块黑
   const cover = liveImageUrl(streamer.id, 'cover', streamer.live_cover_url)
 
-  useEffect(
-    () => () => {
-      if (timerRef.current) clearTimeout(timerRef.current)
-    },
-    []
-  )
+  useEffect(() => clearReconnectTimer, [clearReconnectTimer])
 
   const scheduleReconnect = useCallback(
     (why: string) => {
+      if (timerRef.current !== null) return
       // 会话被收回时后端会截断预览流，表现为一次断流：刷新权限点，失效就跳登录页，降级就收起页面
       revalidateMe()
+      if (playingSinceRef.current && Date.now() - playingSinceRef.current >= RESET_ATTEMPTS_AFTER_MS) {
+        attemptsRef.current = 0
+      }
+      playingSinceRef.current = 0
       if (attemptsRef.current >= MAX_AUTO_RECONNECT) {
         setPhase('ended')
         setMessage(`${why}，已重连 ${MAX_AUTO_RECONNECT} 次`)
@@ -194,12 +212,14 @@ export function LivePreviewPlayer({
       setPhase('reconnecting')
       setMessage(`${why}，${RECONNECT_DELAY_MS / 1000} 秒后重连（${attemptsRef.current}/${MAX_AUTO_RECONNECT}）`)
       timerRef.current = setTimeout(() => {
+        timerRef.current = null
+        setReconnectKey(levelKey)
         setPhase('connecting')
         setMessage(null)
         setNonce((n) => n + 1)
       }, RECONNECT_DELAY_MS)
     },
-    [onFatal]
+    [onFatal, levelKey]
   )
 
   // 直连出问题（CDN 403 / 直链过期 / 断开）：重取一次直链再播；再失败就回落中转，不再试直连
@@ -263,27 +283,33 @@ export function LivePreviewPlayer({
         scheduleReconnect(text)
         return
       }
+      clearReconnectTimer()
       setPhase('error')
       setMessage(text)
       onFatal?.(text)
     },
-    [source, handleDirectFailure, scheduleReconnect, onFatal]
+    [source, handleDirectFailure, scheduleReconnect, onFatal, clearReconnectTimer]
   )
   const retry = () => {
+    clearReconnectTimer()
     attemptsRef.current = 0
+    setReconnectKey(null)
     setPhase('connecting')
     setMessage(null)
     setNonce((n) => n + 1)
   }
 
-  // 播放器一旦起播就当作在放（mpegts.js 没有可靠的 first-frame 事件；错误会另行回调）
-  useEffect(() => {
-    if (phase !== 'connecting') return
-    const t = setTimeout(() => setPhase((p) => (p === 'connecting' ? 'playing' : p)), 1500)
-    return () => clearTimeout(t)
-  }, [phase, nonce])
+  const handlePlaying = useCallback(() => {
+    playingSinceRef.current = Date.now()
+    setMessage(null)
+    setPhase('playing')
+  }, [])
+  const handleConnecting = useCallback(() => {
+    playingSinceRef.current = 0
+    setPhase('connecting')
+  }, [])
 
-  const pending = source === null
+  const pending = source === null || (source.kind === 'relay' && (!format || (format === 'fmp4' && !codecs)))
   const showPlayer = (phase === 'connecting' || phase === 'playing') && !pending
   const badge =
     source?.kind === 'direct'
@@ -313,8 +339,11 @@ export function LivePreviewPlayer({
           autoplay
           onEnded={handleEnded}
           onError={handleError}
+          onConnecting={handleConnecting}
+          onPlaying={handlePlaying}
           onStall={handleStall}
           danmaku={danmakuLayer}
+          lease={lease}
         />
       ) : null}
       {badge ? (
@@ -349,7 +378,7 @@ export function LivePreviewPlayer({
           ) : null}
           <div className={styles.overlayText}>
             {pending
-              ? '正在获取直链…'
+              ? source === null ? '正在获取直链…' : '正在等待媒体初始化…'
               : phase === 'connecting'
                 ? source.kind === 'direct'
                   ? '正在连接 CDN…'
@@ -372,143 +401,33 @@ export function LivePreviewPlayer({
   )
 }
 
-/** 卡片里的「预览」弹层：关闭即卸载播放器、断开连接。 */
-export function LivePreviewModal({
-  streamer,
-  visible,
-  onClose,
-}: {
-  streamer: LiveStreamerEntity
-  visible: boolean
-  onClose: () => void
-}) {
-  const { Text } = Typography
-  const name = streamer.remark || streamer.url
-  const rate = formatRate(streamer.live_bytes_per_sec)
-  const format = streamer.preview?.format
-  const danmakuAvailable = !!streamer.preview?.danmaku
-  const [danmakuPref, setDanmakuPref] = useBoolPref(MODAL_DANMAKU_KEY, true)
-  const danmakuOn = visible && danmakuAvailable && danmakuPref
-  const danmakuFeed = useDanmakuFeed([streamer.id], danmakuOn)
-  const [chartOpen, setChartOpen] = useBoolPref(MODAL_RATE_CHART_KEY, true)
-  const transport = usePreviewTransport()
-  const [latency, setLatency] = useLatencyProfile()
-  const notifiedRef = useRef(false)
-  useEffect(() => {
-    if (!visible) notifiedRef.current = false
-  }, [visible])
-  const handleFatal = useCallback(
-    (text: string) => {
-      if (notifiedRef.current) return
-      notifiedRef.current = true
-      Toast.error({ content: `预览中断：${text}`, duration: 4 })
-    },
-    []
-  )
+/** 直播预览页的地址（静态导出不支持动态路由，直播间走查询串） */
+export function livePageHref(id: number): string {
+  return `/live?streamer=${id}`
+}
 
-  return (
-    <Modal
-      visible={visible}
-      onCancel={onClose}
-      closeOnEsc
-      footer={null}
-      className={styles.modal}
-      style={{ width: 'min(960px, 94vw)' }}
-      bodyStyle={{ padding: 0 }}
-      title={
-        <div className={styles.modalTitle}>
-          <span className={styles.modalName} title={name}>
-            {name}
-          </span>
-          <Tag size="small" color="green">
-            {platformName(streamer.url)}
-          </Tag>
-          {previewFormatLabel(format) ? (
-            <Tag size="small" color="grey">
-              {previewFormatLabel(format)}
-            </Tag>
-          ) : null}
-          <Text type="tertiary" size="small">
-            {rate ? `写盘 ${rate}` : '写盘速率 —'}
-          </Text>
-          <Tooltip
-            content={
-              danmakuAvailable
-                ? '显示录制中的实时弹幕（来自本进程的弹幕客户端）'
-                : '这一路没有弹幕客户端：平台不支持，或未开启对应的 *_danmaku 配置（B 站 / 抖音 / 斗鱼 / 虎牙可开）'
-            }
-          >
-            <span className={styles.danmakuSwitch}>
-              <Text type="tertiary" size="small">
-                弹幕
-              </Text>
-              <Switch
-                size="small"
-                checked={danmakuAvailable && danmakuPref}
-                disabled={!danmakuAvailable}
-                onChange={(v) => setDanmakuPref(!!v)}
-                aria-label="弹幕"
-              />
-            </span>
-          </Tooltip>
-          {transport === 'relay' ? (
-            <Tooltip
-              content={`中转缓冲深度，也就是画面延迟。低延迟：FLV 约 ${RELAY_PROFILES.low.target} s、HLS 分片流（fMP4 / TS）约 ${RELAY_PROFILES_SEGMENTED.low.target} s，链路抖动大时可能偶发缓冲，卡了会自动切到流畅；流畅：约 ${RELAY_PROFILES.smooth.target} s。直连 CDN 时不适用`}
-            >
-              <span className={styles.danmakuSwitch}>
-                <RadioGroup
-                  type="button"
-                  buttonSize="small"
-                  value={latency}
-                  onChange={(e) => setLatency(e.target.value as LatencyProfile)}
-                  aria-label="中转延迟"
-                >
-                  <Radio value="low">低延迟</Radio>
-                  <Radio value="smooth">流畅</Radio>
-                </RadioGroup>
-              </span>
-            </Tooltip>
-          ) : null}
-        </div>
+/**
+ * 打开直播预览页：普通点击在本标签页里跳转；按住 Ctrl / ⌘ / Shift 点击在新标签页打开
+ * （新标签页有自己的租约会话，和本页互不影响）。
+ */
+export function useOpenLivePage(): (id: number, e?: React.MouseEvent | React.KeyboardEvent) => void {
+  const router = useRouter()
+  return useCallback(
+    (id, e) => {
+      const href = livePageHref(id)
+      if (e && (e.ctrlKey || e.metaKey || e.shiftKey)) {
+        window.open(href, '_blank', 'noopener')
+        return
       }
-    >
-      {/* 弹层关闭即卸载：不留后台连接 */}
-      {visible ? (
-        <LivePreviewPlayer streamer={streamer} danmakuFeed={danmakuOn ? danmakuFeed : null} onFatal={handleFatal} />
-      ) : null}
-      {/* 写盘速率折线：每秒轮询瘦端点 /v1/live-rates，最近 3 分钟；折叠时不轮询、不加载 uPlot */}
-      <section className={styles.rateSection} data-open={chartOpen ? 'true' : 'false'}>
-        <button
-          type="button"
-          className={styles.rateHead}
-          onClick={() => setChartOpen(!chartOpen)}
-          aria-expanded={chartOpen}
-          aria-controls={`live-rate-chart-${streamer.id}`}
-        >
-          <IconChevronDown className={styles.rateChevron} aria-hidden="true" />
-          <span className={styles.rateTitle}>写盘速率 · 最近 3 分钟</span>
-          {visible && chartOpen ? <LiveRateSummary id={streamer.id} windowMs={MODAL_RATE_WINDOW_MS} /> : null}
-        </button>
-        {visible && chartOpen ? (
-          <div id={`live-rate-chart-${streamer.id}`} className={styles.rateBody}>
-            <LiveRateChart id={streamer.id} windowMs={MODAL_RATE_WINDOW_MS} variant="full" height={150} label={name} />
-          </div>
-        ) : null}
-      </section>
-      <div className={styles.modalFoot}>
-        <Text type="tertiary" size="small">
-          {transport === 'direct'
-            ? '直连模式：能直连的平台由浏览器直接向 CDN 拉流，不经 biliup；不能的自动回落到录制流中转（角标标出原因）。关闭弹窗即断开。'
-            : '画面来自正在写盘的同一路流，不另外向直播平台拉流；关闭弹窗即断开。'}
-        </Text>
-      </div>
-    </Modal>
+      router.push(href)
+    },
+    [router]
   )
 }
 
 /**
- * 「预览」按钮 + 弹层。录制中且下载器能旁路时可点；否则禁用并用 tooltip 说明原因
- * （ffmpeg / streamlink 子进程落盘、fMP4、HEVC、容器尚未确定）。
+ * 「预览」按钮：进入直播预览页。录制中且下载器能旁路时可点；否则禁用并用 tooltip 说明原因
+ * （ffmpeg / streamlink 子进程落盘、容器尚未确定）。
  */
 export function LivePreviewButton({
   streamer,
@@ -523,7 +442,7 @@ export function LivePreviewButton({
   iconOnly?: boolean
   className?: string
 }) {
-  const [open, setOpen] = useState(false)
+  const openLivePage = useOpenLivePage()
   const enabled = canPreview(streamer)
   const reason = previewDisabledReason(streamer)
   const button = (
@@ -537,25 +456,18 @@ export function LivePreviewButton({
       aria-label={iconOnly ? '预览' : undefined}
       onClick={(e) => {
         e.stopPropagation()
-        setOpen(true)
+        openLivePage(streamer.id, e)
       }}
     >
       {iconOnly ? null : '预览'}
     </Button>
   )
-  return (
-    <>
-      {enabled ? (
-        button
-      ) : (
-        <Tooltip content={reason ?? '暂不可预览'}>
-          {/* disabled 按钮不触发鼠标事件，包一层让 tooltip 仍能弹出 */}
-          <span className={styles.disabledWrap}>{button}</span>
-        </Tooltip>
-      )}
-      {open ? (
-        <LivePreviewModal streamer={streamer} visible={open} onClose={() => setOpen(false)} />
-      ) : null}
-    </>
+  return enabled ? (
+    button
+  ) : (
+    <Tooltip content={reason ?? '暂不可预览'}>
+      {/* disabled 按钮不触发鼠标事件，包一层让 tooltip 仍能弹出 */}
+      <span className={styles.disabledWrap}>{button}</span>
+    </Tooltip>
   )
 }

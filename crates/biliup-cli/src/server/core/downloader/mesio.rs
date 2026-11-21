@@ -3,18 +3,19 @@
 //! 不依赖外部 `mesio` 二进制。
 //!
 //! 生命周期与其它下载器一致：`download` 阻塞到直播流结束 / 被 `stop` 取消 /
-//! 录制时间范围到期，期间每关闭一个分段文件就触发一次 [`SegmentEvent::Segment`]。
+//! 录制时间范围到期，期间每打开一个分段文件触发一次 [`SegmentEvent::Start`]，
+//! 每关闭一个触发一次 [`SegmentEvent::Segment`]。
+
+mod index_tap;
 
 use crate::server::common::construct_headers;
-use crate::server::common::util::media_ext_from_url;
-use crate::server::core::downloader::{
-    self, DownloadConfig, DownloadStatus, SegmentEvent, SegmentInfo,
-};
+use crate::server::common::util::{media_ext_from_url, parse_segment_time};
+use crate::server::core::downloader::{DownloadConfig, DownloadStatus, SegmentEvent, SegmentInfo};
 use crate::server::errors::{AppError, AppResult};
 use biliup::downloader::preview::{self, ChunkKind, PreviewFormat, PreviewSink};
 use biliup::downloader::util::ByteCounter;
 use error_stack::Report;
-use flv::{CodecKind, FlvData};
+use flv::FlvData;
 use flv_fix::{
     ContinuityMode, FlvPipeline, FlvPipelineConfig, FlvWriter, FlvWriterConfig, ScriptFillerConfig,
 };
@@ -34,7 +35,9 @@ use pipeline_common::{
 };
 use std::path::PathBuf;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, RwLock};
+#[cfg(test)]
 use std::time::Duration;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tracing::{debug, info, warn};
@@ -45,10 +48,24 @@ const CHANNEL_SIZE: usize = 64;
 /// 视频断流阈值（流时间）：音频照常推进而视频停住这么久，就结束本次拉流，
 /// 让下载循环重新解析直链重连。正常流里音视频交错，相差只有几十毫秒。
 /// 2026-10-03 B 站 CDN 重连后只下发音频，flv-fix 只打 WARN，白录了两个多小时。
-const VIDEO_STALL_MS: u32 = 10_000;
+///
+/// 按本场连续断流次数取值。前两次很快重连：CDN 节点出错时换直链就能恢复。
+/// 2026-11-03 连续十几次重连都只有音频，说明源头也没有画面，这时 10 秒一段的
+/// 分段全被 filter_size 删掉，连音频都留不下；所以之后拉长到 15 分钟一段
+/// （约 34 MB 音频，过得了默认的 20 MB 过滤），保住音频，同时定期换直链重试。
+const VIDEO_STALL_LADDER_MS: [u32; 4] = [10_000, 10_000, 60_000, 900_000];
 
-/// 分段回调载荷：已关闭的分段文件路径、0 起始的序号、时长（秒）与字节数。
-type SegmentClosed = (PathBuf, u32, f64, u64);
+/// 视频帧连续推进这么久（流时间）才算画面恢复，清零断流计数。
+/// CDN 每次重连都会先回放约 8 秒的 GOP 缓存，不能据此判定恢复。
+const VIDEO_RECOVERED_MS: u32 = 60_000;
+
+/// writer 线程回传的分段事件。开段与关段走同一条通道，回调看到的顺序与落盘顺序一致。
+#[derive(Debug)]
+enum WriterEvent {
+    Opened(PathBuf),
+    /// 已关闭的分段文件路径、0 起始的序号、时长（秒）与字节数。
+    Closed(PathBuf, u32, f64, u64),
+}
 
 /// 直播预览旁路：写入端与「把一个管线条目旁路给它」的函数。
 type PreviewTee<I> = (PreviewSink, fn(&mut PreviewSink, &I));
@@ -56,6 +73,8 @@ type PreviewTee<I> = (PreviewSink, fn(&mut PreviewSink, &I));
 /// mesio 下载器实例。可跨多次 `download` 复用，每次调用使用新的取消令牌。
 pub struct Mesio {
     token: RwLock<CancellationToken>,
+    /// 本场录制里连续因视频断流结束拉流的次数，跨重连保留，决定下一次的断流阈值。
+    video_stalls: Arc<AtomicU32>,
 }
 
 impl Default for Mesio {
@@ -68,6 +87,7 @@ impl Mesio {
     pub fn new() -> Self {
         Self {
             token: RwLock::new(CancellationToken::new()),
+            video_stalls: Arc::new(AtomicU32::new(0)),
         }
     }
 
@@ -114,19 +134,22 @@ impl Mesio {
         let pipeline_config = pipeline_config(&download_config);
         let output_dir = download_config.output_dir.clone();
         let base_name = download_config.recorder.filename_template();
-        let (seg_tx, seg_rx) = unbounded_channel::<SegmentClosed>();
+        let (seg_tx, seg_rx) = unbounded_channel::<WriterEvent>();
 
         // 录制时间范围：管线只负责按时长切片而不会自行退出，到点后主动取消，
         // 与 ffmpeg 内部分段用 `-t` 截停的语义一致。
-        let window_timer = download_config.time_range_remaining().map(|remaining| {
-            let secs = downloader::parse_duration(&remaining);
-            let token = token.clone();
-            tokio::spawn(async move {
-                tokio::time::sleep(Duration::from_secs(secs)).await;
-                info!("录制时间范围结束，停止 mesio 拉流");
-                token.cancel();
-            })
-        });
+        let window_timer = download_config
+            .time_range_remaining()
+            .as_deref()
+            .and_then(parse_segment_time)
+            .map(|remaining| {
+                let token = token.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(remaining).await;
+                    info!("录制时间范围结束，停止 mesio 拉流");
+                    token.cancel();
+                })
+            });
 
         let outcome = match session {
             DownloaderSession::Flv(session) => {
@@ -135,7 +158,8 @@ impl Mesio {
                     output_dir,
                     base_name,
                 });
-                writer.set_on_segment_complete_callback(segment_complete_hook(seg_tx));
+                let index_queue =
+                    index_tap::install(&mut writer, seg_tx, download_config.index_tap.clone());
                 let keyframe_duration_ms = pipeline_config
                     .max_duration
                     .map(|d| u32::try_from(d.as_millis()).unwrap_or(u32::MAX));
@@ -155,7 +179,7 @@ impl Mesio {
                     handle,
                 } = session;
                 let event_task = tokio::spawn(log_events(events));
-                let items = stop_on_video_stall(items)
+                let items = stop_on_video_stall(items, self.video_stalls.clone())
                     .map(|r| r.map_err(|e| PipelineError::Strategy(Box::new(e))));
                 let preview = download_config.preview.attach(PreviewFormat::Flv);
                 let outcome = run_pipeline::<FlvPipeline, _>(
@@ -169,6 +193,7 @@ impl Mesio {
                     callback.as_mut(),
                     (download_config.bytes_written.clone(), |item| item.size()),
                     Some((preview, tee_flv)),
+                    index_queue,
                 )
                 .await;
                 handle.cancel();
@@ -218,7 +243,8 @@ impl Mesio {
                     max_file_size: (pipeline_config.max_file_size > 0)
                         .then_some(pipeline_config.max_file_size),
                 });
-                writer.set_on_segment_complete_callback(segment_complete_hook(seg_tx));
+                let index_queue =
+                    index_tap::install(&mut writer, seg_tx, download_config.index_tap.clone());
                 let items = stream::once(async { Ok(first) })
                     .chain(items)
                     .map(|r| r.map_err(|e| PipelineError::Strategy(Box::new(e))));
@@ -233,6 +259,7 @@ impl Mesio {
                     callback.as_mut(),
                     (download_config.bytes_written.clone(), |item| item.size()),
                     preview,
+                    index_queue,
                 )
                 .await;
                 handle.cancel();
@@ -336,13 +363,29 @@ fn warn_on_suffix_mismatch(configured: &str, actual: &str) {
     }
 }
 
+/// 输出目录是 `.` 时 writer 给出 `./x.flv`；去掉前缀，与 stream-gears 给出的路径同一形式，
+/// 弹幕 XML、文件列表都按这个路径命名和记录。开段、关段和流式关键帧索引必须同一形式，
+/// 切片工作台按路径配对分段、按路径查边写边建的索引。
+fn reported_path(path: &std::path::Path) -> &std::path::Path {
+    path.strip_prefix(".").unwrap_or(path)
+}
+
+fn segment_start_hook(
+    seg_tx: UnboundedSender<WriterEvent>,
+) -> impl Fn(&std::path::Path, u32) + Send + Sync + 'static {
+    move |path, _index| {
+        let _ = seg_tx.send(WriterEvent::Opened(reported_path(path).to_path_buf()));
+    }
+}
+
 fn segment_complete_hook(
-    seg_tx: UnboundedSender<SegmentClosed>,
+    seg_tx: UnboundedSender<WriterEvent>,
 ) -> impl Fn(&std::path::Path, u32, f64, u64, Option<&pipeline_common::SplitReason>)
 + Send
 + Sync
 + 'static {
     move |path, index, duration_secs, size_bytes, reason| {
+        let path = reported_path(path);
         info!(
             path = %path.display(),
             index,
@@ -351,7 +394,12 @@ fn segment_complete_hook(
             reason = ?reason,
             "mesio 分段完成"
         );
-        let _ = seg_tx.send((path.to_path_buf(), index, duration_secs, size_bytes));
+        let _ = seg_tx.send(WriterEvent::Closed(
+            path.to_path_buf(),
+            index,
+            duration_secs,
+            size_bytes,
+        ));
     }
 }
 
@@ -366,6 +414,9 @@ fn segment_complete_hook(
 ///
 /// `preview`：直播预览的写入端与「把一个条目旁路给它」的函数，同样在条目进入管线前
 /// 调用（预览拿到的是拉到的原始流，不含修复管线的改动）。只是 push，不会失败、不 await。
+///
+/// `index_queue`：关键帧索引旁路的条目队列（见 [`index_tap`]），在管线之后、writer 之前记下每个条目
+/// 要进索引的部分（FLV 是就地判定的结果，HLS 是分片 `Bytes` 的引用计数）。
 #[allow(clippy::too_many_arguments)]
 async fn run_pipeline<'a, P, W>(
     common: &PipelineConfig,
@@ -373,14 +424,16 @@ async fn run_pipeline<'a, P, W>(
     items: Pin<Box<dyn Stream<Item = Result<P::Item, PipelineError>> + Send>>,
     spec: ChannelSpec<P::Item>,
     mut writer: W,
-    mut seg_rx: UnboundedReceiver<SegmentClosed>,
+    mut seg_rx: UnboundedReceiver<WriterEvent>,
     token: CancellationToken,
     callback: &mut (dyn FnMut(SegmentEvent) + Send + Sync + 'a),
     byte_meter: (ByteCounter, fn(&P::Item) -> usize),
     preview: Option<PreviewTee<P::Item>>,
+    index_queue: Option<std::sync::mpsc::Sender<index_tap::Entry>>,
 ) -> Result<WriterStats, String>
 where
     P: PipelineProvider,
+    P::Item: index_tap::Indexable + Send + 'static,
     W: ProtocolWriter<Item = P::Item>,
 {
     let context = Arc::new(StreamerContext::new(token));
@@ -390,6 +443,10 @@ where
         output_rx,
         tasks,
     } = spawn_pipeline(provider.build_pipeline(), spec);
+    let output_rx = match index_queue {
+        Some(queue) => index_tap::forward(output_rx, queue, CHANNEL_SIZE),
+        None => output_rx,
+    };
 
     let writer_task = tokio::task::spawn_blocking(move || writer.run(output_rx));
 
@@ -411,11 +468,16 @@ where
         }
     });
 
-    while let Some((path, index, duration_secs, size_bytes)) = seg_rx.recv().await {
-        callback(SegmentEvent::Segment(
-            SegmentInfo::new(path, None, None, index as usize)
-                .with_stats(duration_secs, size_bytes),
-        ));
+    while let Some(event) = seg_rx.recv().await {
+        callback(match event {
+            WriterEvent::Opened(path) => SegmentEvent::Start {
+                next_file_path: path,
+            },
+            WriterEvent::Closed(path, index, duration_secs, size_bytes) => SegmentEvent::Segment(
+                SegmentInfo::new(path, None, None, index as usize)
+                    .with_stats(duration_secs, size_bytes),
+            ),
+        });
     }
 
     if let Err(e) = forward.await {
@@ -434,33 +496,59 @@ where
 
 /// 视频断流时提前结束 FLV 输入流。管线照常收尾、关闭当前分段，下载器返回
 /// `StreamEnded`，房间仍在直播时下载循环会立即重新解析直链。
-fn stop_on_video_stall<S, E>(items: S) -> impl Stream<Item = Result<FlvData, E>>
+fn stop_on_video_stall<S, E>(
+    items: S,
+    stalls: Arc<AtomicU32>,
+) -> impl Stream<Item = Result<FlvData, E>>
 where
     S: Stream<Item = Result<FlvData, E>>,
 {
-    let mut guard = VideoStallGuard::default();
+    let mut guard = VideoStallGuard::new(stalls);
     items.take_while(move |item| future::ready(!matches!(item, Ok(data) if guard.stalled(data))))
 }
 
-/// 按流时间判定视频断流。从未出现过视频帧的流（纯音频直播）不会触发。
-#[derive(Default)]
+/// 按流时间判定视频断流。
+///
+/// 出现过视频 tag（含序列头）就认为这路流应当有画面：2026-11-03 那次重连拿到的流
+/// 只有一个 AVC 序列头、没有一帧画面，只认视频帧的旧判定因此一直没触发。
+/// 从头到尾没有任何视频 tag 的流（纯音频直播）不会触发。
 struct VideoStallGuard {
-    seen_video: bool,
-    /// 最近一个视频帧之后第一个音频 tag 的时间戳
+    stalls: Arc<AtomicU32>,
+    threshold_ms: u32,
+    expects_video: bool,
+    /// 本次拉流第一个视频帧的时间戳
+    first_video: Option<u32>,
+    recovered: bool,
+    /// 最近一个视频帧之后（或还没有视频帧时）第一个音频 tag 的时间戳
     audio_since_video: Option<u32>,
 }
 
 impl VideoStallGuard {
+    fn new(stalls: Arc<AtomicU32>) -> Self {
+        let n = stalls.load(Ordering::Relaxed) as usize;
+        let threshold_ms = VIDEO_STALL_LADDER_MS[n.min(VIDEO_STALL_LADDER_MS.len() - 1)];
+        Self {
+            stalls,
+            threshold_ms,
+            expects_video: false,
+            first_video: None,
+            recovered: false,
+            audio_since_video: None,
+        }
+    }
+
     fn stalled(&mut self, item: &FlvData) -> bool {
         let FlvData::Tag(tag) = item else {
             return false;
         };
-        if tag.is_video_tag() && !tag.is_video_sequence_header() {
-            self.seen_video = true;
-            self.audio_since_video = None;
+        if tag.is_video_tag() {
+            self.expects_video = true;
+            if !tag.is_video_sequence_header() {
+                self.on_video_frame(tag.timestamp_ms);
+            }
             return false;
         }
-        if !tag.is_audio_tag() || !self.seen_video {
+        if !tag.is_audio_tag() || !self.expects_video {
             return false;
         }
         let now = tag.timestamp_ms;
@@ -468,9 +556,12 @@ impl VideoStallGuard {
             // 时间戳回退（流内重置）时重新起算，宁可晚判也不误判
             Some(start) if now >= start => {
                 let stalled_ms = now - start;
-                if stalled_ms >= VIDEO_STALL_MS {
+                if stalled_ms >= self.threshold_ms {
+                    let stalls = self.stalls.fetch_add(1, Ordering::Relaxed) + 1;
                     warn!(
                         stalled_ms,
+                        stalls,
+                        saw_video_frame = self.first_video.is_some(),
                         "视频已停止而音频仍在推进，结束本次拉流以重新解析直链"
                     );
                     return true;
@@ -480,13 +571,25 @@ impl VideoStallGuard {
         }
         false
     }
+
+    fn on_video_frame(&mut self, ts: u32) {
+        self.audio_since_video = None;
+        let first = *self.first_video.get_or_insert(ts);
+        if !self.recovered && ts >= first && ts - first >= VIDEO_RECOVERED_MS {
+            self.recovered = true;
+            let previous = self.stalls.swap(0, Ordering::Relaxed);
+            if previous > 0 {
+                info!(stalls = previous, "视频画面已恢复，断流计数清零");
+            }
+        }
+    }
 }
 
 /// 把一个 mesio FLV 条目旁路给直播预览，重新编成与 FLV 文件一致的字节排列。
 ///
 /// 类型判定沿用 `flv` crate 对 tag 的分类；修复管线的控制项（`Split` / `EndOfSequence`）
-/// 不是媒体字节，跳过。视频序列头是 HEVC 时把 hub 标为不可预览（Chrome 的 MSE 放不了），
-/// 录制本身不受影响。
+/// 不是媒体字节，跳过。AVC、HEVC（legacy / E-RTMP）和 AV1 均保留完整序列头与 GOP，
+/// 浏览器与播放器依据实际编码能力决定是否可以解码。
 fn tee_flv(sink: &mut PreviewSink, item: &FlvData) {
     match item {
         FlvData::Header(header) => {
@@ -501,11 +604,6 @@ fn tee_flv(sink: &mut PreviewSink, item: &FlvData) {
             } else if tag.is_audio_sequence_header() {
                 ChunkKind::SequenceHeader(preview::flv::TAG_AUDIO)
             } else if tag.is_video_sequence_header() {
-                if class.codec == Some(CodecKind::Hevc) {
-                    sink.mark_unavailable(
-                        "视频为 HEVC 编码，浏览器内的播放器无法解码，录制不受影响",
-                    );
-                }
                 ChunkKind::SequenceHeader(preview::flv::TAG_VIDEO)
             } else if tag.is_video_tag() && class.keyframe_media {
                 ChunkKind::Keyframe
@@ -597,6 +695,32 @@ mod tests {
     }
 
     #[test]
+    fn segment_paths_under_the_current_dir_drop_the_dot_prefix() {
+        let (tx, mut rx) = unbounded_channel();
+        let start = segment_start_hook(tx.clone());
+        let complete = segment_complete_hook(tx);
+        for (i, path) in ["./x.flv", "./sub/y.flv", "/data/z.flv", "w.flv"]
+            .into_iter()
+            .enumerate()
+        {
+            start(std::path::Path::new(path), i as u32);
+            complete(std::path::Path::new(path), i as u32, 1.0, 10, None);
+        }
+
+        let events: Vec<(bool, PathBuf)> = std::iter::from_fn(|| rx.try_recv().ok())
+            .map(|event| match event {
+                WriterEvent::Opened(path) => (true, path),
+                WriterEvent::Closed(path, ..) => (false, path),
+            })
+            .collect();
+        let expected: Vec<(bool, PathBuf)> = ["x.flv", "sub/y.flv", "/data/z.flv", "w.flv"]
+            .into_iter()
+            .flat_map(|p| [(true, PathBuf::from(p)), (false, PathBuf::from(p))])
+            .collect();
+        assert_eq!(events, expected);
+    }
+
+    #[test]
     fn segment_time_and_file_size_become_pipeline_limits() {
         let config = DownloadConfig {
             segment_time: Some("01:30:00".to_string()),
@@ -621,7 +745,8 @@ mod tests {
     }
 
     /// 端到端：本地 HTTP 服务吐一段真实 FLV 录像，走完整的引擎拉流 → 修复管线 → 落盘，
-    /// 校验分段回调触发、按大小切片、文件名沿用 biliup 的模板。
+    /// 校验分段回调触发、按大小切片、文件名沿用 biliup 的模板；
+    /// 关键帧索引旁路边写边建的 `.idx` 与对落盘文件扫盘的结果一致。
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn downloads_a_local_flv_through_the_engine_and_reports_segments() {
         use crate::server::common::util::Recorder;
@@ -632,7 +757,8 @@ mod tests {
         // 造一段合法 FLV：头 + 一个视频关键帧标签，重复多次以触发按大小分段
         let mut payload = Vec::new();
         payload.extend_from_slice(&[0x46, 0x4C, 0x56, 0x01, 0x01, 0, 0, 0, 9, 0, 0, 0, 0]);
-        let data = vec![0x17u8, 0x01, 0, 0, 0, 0xAA, 0xBB, 0xCC, 0xDD];
+        // AVC 关键帧：一个 1 字节的 IDR NALU（类型 5）
+        let data = vec![0x17u8, 0x01, 0, 0, 0, 0, 0, 0, 1, 0x65];
         for i in 0..400u32 {
             let ts = i * 40;
             payload.push(9);
@@ -673,7 +799,9 @@ mod tests {
             suffix: "flv".to_string(),
             bytes_written: ByteCounter::new(),
             preview: Default::default(),
+            index_tap: Some(crate::server::workbench::index::live::spawn()),
         };
+        let index_tap = config.index_tap.clone().unwrap();
         let bytes_written = config.bytes_written.clone();
         let preview = config.preview.clone();
 
@@ -692,6 +820,7 @@ mod tests {
             .expect("download");
 
         assert_eq!(status, DownloadStatus::StreamEnded);
+        index_tap.sync().await;
         assert_eq!(
             bytes_written.total(),
             payload_len as u64,
@@ -723,6 +852,24 @@ mod tests {
                 "reported duration of {name}: {:?}",
                 info.duration_secs
             );
+        }
+
+        use crate::server::workbench::index;
+        let scratch = tempfile::tempdir().unwrap();
+        for info in seen.iter() {
+            let path = &info.prev_file_path;
+            let streamed = index::load(path).expect("streamed index");
+            assert_eq!(streamed.source_len, std::fs::metadata(path).unwrap().len());
+            assert!(!index::live::is_live(path));
+            let copy = scratch.path().join(path.file_name().unwrap());
+            std::fs::copy(path, &copy).unwrap();
+            let scanned = index::refresh(&copy, true).unwrap();
+            assert!(!scanned.keyframes.is_empty());
+            assert_eq!(streamed.keyframes, scanned.keyframes, "{}", path.display());
+            assert_eq!(streamed.header_len, scanned.header_len);
+            assert_eq!(streamed.base_ts, scanned.base_ts);
+            assert_eq!(streamed.duration_ms, scanned.duration_ms);
+            assert_eq!(streamed.scanned_upto, scanned.scanned_upto);
         }
     }
 
@@ -811,7 +958,7 @@ mod tests {
     }
 
     #[test]
-    fn tee_flv_marks_hevc_streams_as_not_previewable() {
+    fn tee_flv_keeps_hevc_available_for_capable_browsers() {
         use biliup::downloader::preview::{PreviewFormat, PreviewHub};
         use flv::{FlvTag, FlvTagType};
 
@@ -827,8 +974,8 @@ mod tests {
         ));
         tee_flv(&mut sink, &hevc);
         let status = hub.status();
-        assert!(!status.available);
-        assert!(status.reason.unwrap().contains("HEVC"));
+        assert!(status.available);
+        assert_eq!(status.reason, None);
     }
 
     #[tokio::test]
@@ -956,9 +1103,13 @@ mod tests {
             items.push(audio(ts));
         }
         let total = items.len();
-        let kept: Vec<_> = stop_on_video_stall(stream::iter(items.into_iter().map(Ok::<_, ()>)))
-            .collect()
-            .await;
+        let stalls = Arc::new(AtomicU32::new(0));
+        let kept: Vec<_> = stop_on_video_stall(
+            stream::iter(items.into_iter().map(Ok::<_, ()>)),
+            stalls.clone(),
+        )
+        .collect()
+        .await;
         assert!(kept.len() < total);
         let FlvData::Tag(last) = kept.last().unwrap().as_ref().unwrap() else {
             panic!("expected a tag");
@@ -969,27 +1120,74 @@ mod tests {
             "{}",
             last.timestamp_ms
         );
+        assert_eq!(stalls.load(Ordering::Relaxed), 1);
+    }
+
+    fn fresh_guard() -> VideoStallGuard {
+        VideoStallGuard::new(Arc::new(AtomicU32::new(0)))
     }
 
     #[test]
     fn video_stall_guard_ignores_healthy_and_audio_only_streams() {
-        let mut guard = VideoStallGuard::default();
+        let mut guard = fresh_guard();
+        assert!(!guard.stalled(&video_sequence_header(0)));
         for ts in (0..120_000).step_by(33) {
             assert!(!guard.stalled(&video(ts)));
             assert!(!guard.stalled(&audio(ts)));
         }
 
-        // 纯音频直播，或只有视频序列头没有视频帧：不算见过视频
-        let mut guard = VideoStallGuard::default();
-        assert!(!guard.stalled(&video_sequence_header(0)));
+        // 纯音频直播：没有任何视频 tag
+        let mut guard = fresh_guard();
         for ts in (0..120_000).step_by(23) {
             assert!(!guard.stalled(&audio(ts)));
         }
     }
 
+    /// 2026-11-03 的形态：重连后只有视频序列头，没有一帧画面，之后全是音频。
+    #[test]
+    fn video_stall_guard_fires_when_only_a_sequence_header_arrives() {
+        let mut guard = fresh_guard();
+        assert!(!guard.stalled(&video_sequence_header(1)));
+        assert!(!guard.stalled(&audio(0)));
+        assert!(!guard.stalled(&audio(9_990)));
+        assert!(guard.stalled(&audio(10_000)));
+    }
+
+    #[test]
+    fn video_stall_threshold_grows_with_consecutive_stalls_and_resets_on_recovery() {
+        let stalls = Arc::new(AtomicU32::new(0));
+        let fire_at = |stalls: &Arc<AtomicU32>| {
+            let mut guard = VideoStallGuard::new(stalls.clone());
+            assert!(!guard.stalled(&video_sequence_header(0)));
+            (0..2_000_000)
+                .step_by(23)
+                .find(|&ts| guard.stalled(&audio(ts)))
+                .unwrap()
+        };
+        let thresholds: Vec<u32> = (0..6).map(|_| fire_at(&stalls)).collect();
+        assert_eq!(
+            thresholds.iter().map(|t| t / 1_000).collect::<Vec<_>>(),
+            vec![10, 10, 60, 900, 900, 900]
+        );
+        assert_eq!(stalls.load(Ordering::Relaxed), 6);
+
+        // GOP 缓存那几秒视频不算恢复
+        let mut guard = VideoStallGuard::new(stalls.clone());
+        for ts in (0..8_000).step_by(33) {
+            assert!(!guard.stalled(&video(ts)));
+        }
+        assert_eq!(stalls.load(Ordering::Relaxed), 6);
+        // 画面持续一分钟才清零
+        for ts in (8_000..61_000).step_by(33) {
+            assert!(!guard.stalled(&video(ts)));
+        }
+        assert_eq!(stalls.load(Ordering::Relaxed), 0);
+        assert_eq!(fire_at(&stalls) / 1_000, 10);
+    }
+
     #[test]
     fn video_stall_guard_restarts_on_audio_timestamp_reset() {
-        let mut guard = VideoStallGuard::default();
+        let mut guard = fresh_guard();
         assert!(!guard.stalled(&video(500_000)));
         assert!(!guard.stalled(&audio(500_000)));
         assert!(!guard.stalled(&audio(509_000)));

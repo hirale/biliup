@@ -41,6 +41,7 @@ impl Role {
                 ConfigView,
                 LogView,
                 FileView,
+                ClipEdit,
             ],
             Role::Viewer => &[StreamerView, PreviewView, ConfigView, LogView, FileView],
         }
@@ -80,7 +81,8 @@ pub enum Permission {
     RecordingControl,
     #[serde(rename = "streamer.edit")]
     StreamerEdit,
-    /// 主播与全局配置里的 `*processor` 钩子和 `override`：钩子走 `sh -c`，等于服务器 shell
+    /// 主播与全局配置里的 `*processor` 钩子、`override` 和主播的 ffmpeg 参数（`opt_args`）：
+    /// 钩子走 `sh -c`，等于服务器 shell；ffmpeg 参数能让 ffmpeg 写任意文件
     #[serde(rename = "streamer.hooks")]
     StreamerHooks,
     #[serde(rename = "upload.submit")]
@@ -100,6 +102,12 @@ pub enum Permission {
     FileView,
     #[serde(rename = "user.manage")]
     UserManage,
+    /// 切片工作台：打标记、保留场次、改切片草稿
+    #[serde(rename = "clip.edit")]
+    ClipEdit,
+    /// Fleet 控制面：生成加入票据、移除节点
+    #[serde(rename = "node.manage")]
+    NodeManage,
 }
 
 impl Permission {
@@ -117,6 +125,8 @@ impl Permission {
         Permission::LogView,
         Permission::FileView,
         Permission::UserManage,
+        Permission::ClipEdit,
+        Permission::NodeManage,
     ];
 }
 
@@ -128,7 +138,7 @@ pub fn required_permission(method: &Method, route: &str, raw_path: &str) -> Opti
     use Permission::*;
     let get = method == Method::GET || method == Method::HEAD;
     let permission = match route {
-        "/v1/streamers" if get => StreamerView,
+        "/v1/streamers" | "/v1/streamers/page" | "/v1/overview" if get => StreamerView,
         "/v1/streamers" if method == Method::POST || method == Method::PUT => StreamerEdit,
         "/v1/streamers/{id}" if method == Method::DELETE => StreamerEdit,
         "/v1/streamers/{id}/pause" if method == Method::PUT => RecordingControl,
@@ -141,10 +151,165 @@ pub fn required_permission(method: &Method, route: &str, raw_path: &str) -> Opti
         {
             PreviewView
         }
+        "/v1/streamers/{id}/live" if method == Method::DELETE || method == Method::POST => {
+            PreviewView
+        }
         "/v1/ws/live-rates" | "/v1/live-rates" if get => StreamerView,
+        "/v1/sessions" | "/v1/sessions/{id}" | "/v1/sessions/{id}/keyframes" if get => FileView,
+        "/v1/editor/projects"
+        | "/v1/editor/projects/{id}"
+        | "/v1/editor/projects/{id}/revisions/{revision}"
+        | "/v1/editor/projects/{id}/revisions"
+        | "/v1/editor/projects/{id}/history"
+            if get =>
+        {
+            FileView
+        }
+        "/v1/editor/projects" if method == Method::POST => ClipEdit,
+        "/v1/editor/projects/{id}/history" if method==Method::POST => ClipEdit,
+        "/v1/editor/projects/{id}/agent/screen-take" if method==Method::POST => ClipEdit,
+        "/v1/editor/projects/{id}/imports" if method == Method::POST => ClipEdit,
+        "/v1/outputs" | "/v1/outputs/processing" | "/v1/editor/projects/{id}/exports" | "/v1/editor/projects/{id}/exports/{job}/download"
+            if get =>
+        {
+            FileView
+        }
+        "/v1/editor/projects/{id}/exports/loudness" if method==Method::POST => FileView,
+        "/v1/editor/projects/{id}/library/items/{item}" if method==Method::POST => ClipEdit,
+        "/v1/editor/projects/{id}/exports" | "/v1/editor/projects/{id}/exports/{job}/cancel" | "/v1/editor/projects/{id}/exports/{job}/retry"
+            if method == Method::POST =>
+        {
+            ClipEdit
+        }
+        "/v1/editor/projects/{id}/media/{media}/{kind}" if get => FileView,
+        "/v1/editor/projects/{id}/analysis" | "/v1/editor/projects/{id}/analysis/media/{media}" if get => FileView,
+        "/v1/editor/setup" | "/v1/editor/transcription" if get => FileView,
+        "/v1/editor/projects/{id}/resources/{kind}" if get => FileView,
+        "/v1/editor/keys" if get => FileView,
+        "/v1/editor/projects/{id}/graphics/{name}" if get => FileView,
+        "/v1/editor/projects/{id}/graphic-media/{media}" if get => FileView,
+        "/v1/editor/projects/{id}/render-assets" if get => FileView,
+        "/v1/editor/projects/{id}/fonts" if get => FileView,
+        "/v1/editor/projects/{id}/proxies" if get => FileView,
+        "/v1/editor/projects/{id}/recent" | "/v1/editor/projects/{id}/recent/{media}/thumb" if get => FileView,
+        "/v1/editor/projects/{id}/links" if get => FileView,
+        "/v1/editor/projects/{id}/agent" if get => FileView,
+        "/v1/editor/projects/{id}/shaders" if get => FileView,
+        "/v1/editor/projects/{id}/agent/plan" | "/v1/editor/projects/{id}/agent/images/{image}" | "/v1/editor/projects/{id}/agent/files/{file}" if get => FileView,
+        "/v1/editor/projects/{id}/agent/plan" if method==Method::PUT => ClipEdit,
+        "/v1/editor/projects/{id}/agent" | "/v1/editor/projects/{id}/agent/cancel" | "/v1/editor/projects/{id}/agent/approve" | "/v1/editor/projects/{id}/agent/thread" | "/v1/editor/projects/{id}/agent/turns/{turn}/undo" if method==Method::POST => ClipEdit,
+        "/v1/editor/projects/{id}/links" | "/v1/editor/projects/{id}/links/check" if method==Method::POST => ClipEdit,
+        "/v1/editor/projects/{id}/recent/{media}/import" if method==Method::POST => ClipEdit,
+        "/v1/editor/projects/{id}/proxies" | "/v1/editor/projects/{id}/proxies/{media}/cancel" | "/v1/editor/projects/{id}/proxies/{media}/retry" if method==Method::POST => ClipEdit,
+        "/v1/editor/projects/{id}/fonts" if method==Method::POST => ClipEdit,
+        "/v1/editor/projects/{id}/graphics" if method==Method::POST => ClipEdit,
+        "/v1/editor/model" if get => FileView,
+        "/v1/editor/model" if method==Method::PUT => ConfigEdit,
+        "/v1/editor/generators" | "/v1/editor/projects/{id}/generation" | "/v1/editor/projects/{id}/generation/{job}" if get => FileView,
+        "/v1/editor/projects/{id}/generation" | "/v1/editor/projects/{id}/generation/{job}" if method==Method::POST || method==Method::DELETE => ClipEdit,
+        "/v1/editor/library/state" | "/v1/editor/library/preview/{source}/{sound}" if get => FileView,
+        "/v1/editor/library/search" if method==Method::POST => FileView,
+        "/v1/editor/projects/{id}/library/online/{source}/{sound}" if method==Method::POST => ClipEdit,
+        "/v1/editor/keys/{provider}" if method==Method::PUT || method==Method::DELETE => ConfigEdit,
+        "/v1/editor/projects/{id}/library/folders" | "/v1/editor/projects/{id}/library/sounds/{sound}/{kind}" if get => FileView,
+        "/v1/editor/projects/{id}/library/folders" | "/v1/editor/projects/{id}/library/folders/{folder}" if method==Method::PUT || method==Method::DELETE => ClipEdit,
+        "/v1/editor/projects/{id}/brand" | "/v1/editor/projects/{id}/brand/files" | "/v1/editor/projects/{id}/brand/{scope}/{kit}/files/{name}" if get => FileView,
+        "/v1/editor/projects/{id}/brand/{scope}/{kit}/files" | "/v1/editor/projects/{id}/brand/{scope}/{kit}/import" if method==Method::POST => ClipEdit,
+        "/v1/editor/projects/{id}/resources/{kind}" if method==Method::PUT || method==Method::DELETE => ClipEdit,
+        "/v1/editor/transcription/download" | "/v1/editor/transcription/cancel" | "/v1/editor/transcription/select" if method==Method::POST => ClipEdit,
+        "/v1/editor/projects/{id}/analysis" | "/v1/editor/projects/{id}/analysis/{job}/cancel" if method==Method::POST => ClipEdit,
+        "/v1/editor/sessions/{id}/media/{media}/{kind}" if get => FileView,
+        "/v1/editor/projects/{id}" if method == Method::PUT || method == Method::DELETE => ClipEdit,
+        "/v1/sessions/{id}/media" if get => PreviewView,
+        "/v1/sessions/{id}/markers" if get => FileView,
+        "/v1/sessions/{id}/markers" if method == Method::POST => ClipEdit,
+        "/v1/sessions/{id}/markers/{mid}"
+            if method == Method::PATCH || method == Method::DELETE =>
+        {
+            ClipEdit
+        }
+        // 与 /v1/status 同级：三个角色都能看首页的系统状态
+        "/v1/system-stats" if get => StreamerView,
+        "/v1/sessions/{id}/clips" | "/v1/clips/{cid}" | "/v1/clips/{cid}/download" if get => {
+            FileView
+        }
+        "/v1/sessions/{id}/clips" | "/v1/clips/{cid}/export" if method == Method::POST => ClipEdit,
+        "/v1/sessions/{id}/clips/{cid}" if method == Method::PATCH || method == Method::DELETE => {
+            ClipEdit
+        }
+        "/v1/clips/{cid}/cover" | "/v1/sessions/{id}/thumb" | "/v1/publish-jobs" if get => FileView,
+        "/v1/clips/{cid}/cover" if method == Method::PUT || method == Method::DELETE => ClipEdit,
+        "/v1/sessions/{id}/render-recipe"
+        | "/v1/sessions/{id}/render-settings"
+        | "/v1/sessions/{id}/render-assets"
+        | "/v1/sessions/{id}/renders"
+        | "/v1/renders"
+        | "/v1/render-gpus"
+        | "/v1/render-assets/{aid}"
+        | "/v1/renders/{jid}"
+        | "/v1/renders/{jid}/download"
+        | "/v1/render-fonts/{id}"
+            if get =>
+        {
+            FileView
+        }
+        "/v1/sessions/{id}/render-recipe" | "/v1/sessions/{id}/render-settings"
+            if method == Method::PUT =>
+        {
+            ClipEdit
+        }
+        "/v1/sessions/{id}/render-assets"
+        | "/v1/sessions/{id}/renders"
+        | "/v1/renders/{jid}/cancel"
+        | "/v1/renders/{jid}/retry"
+            if method == Method::POST =>
+        {
+            ClipEdit
+        }
+        "/v1/render-assets/{aid}" if method == Method::DELETE => ClipEdit,
+        "/v1/renders/{jid}" if method == Method::DELETE => ClipEdit,
+        // Preview converts a recipe snapshot but does not persist a change.
+        "/v1/sessions/{id}/render-preview" if method == Method::POST => FileView,
+        "/v1/render-tools" | "/v1/render-capabilities" if get => StreamerView,
+        "/v1/outputs/{kind}/{id}/publish/covers" if method==Method::POST||method==Method::PUT => UploadSubmit,
+        "/v1/outputs/{kind}/{id}/publish/covers/{cover}" if get => UploadSubmit,
+        "/v1/clips/{cid}/publish"
+        | "/v1/outputs/{kind}/{id}/publish/preview"
+        | "/v1/outputs/{kind}/{id}/publish"
+        | "/v1/publish-jobs"
+        | "/v1/publish-jobs/preview"
+        | "/v1/publish-jobs/resume"
+        | "/v1/publish-jobs/{jid}/retry"
+            if method == Method::POST =>
+        {
+            UploadSubmit
+        }
+        "/v1/publish-jobs/{jid}" if method == Method::DELETE => UploadSubmit,
         "/v1/configuration" if get => ConfigView,
         "/v1/configuration" if method == Method::PUT => ConfigEdit,
+        "/v1/douyu/validate-cookie" if method == Method::POST => ConfigEdit,
+        "/v1/douyu/auth/status" if get => ConfigEdit,
+        "/v1/streamers/{id}/mosaic-frame" if get => StreamerHooks,
+        "/v1/douyu/auth/refresh" if method == Method::POST => ConfigEdit,
+        // 连通性测试会用已保存的 key 调外部接口，归配置编辑；状态不含 key 和地址
+        "/v1/auto-clip/test" if method == Method::POST => ConfigEdit,
+        "/v1/auto-clip/status" | "/v1/auto-clip/jobs" if get => FileView,
+        // 生成候选会花转写/模型的钱，和做切片一样归切片编辑
+        "/v1/sessions/{id}/auto-clip" if get => FileView,
+        "/v1/sessions/{id}/auto-clip" if method == Method::POST || method == Method::DELETE => {
+            ClipEdit
+        }
+        // 候选：看和切片列表一样；接受会建切片草稿，丢弃也改候选，归切片编辑
+        "/v1/sessions/{id}/suggestions" if get => FileView,
+        "/v1/sessions/{id}/danmaku-density" if get => FileView,
+        "/v1/sessions/{id}/suggestions/{sid}/accept"
+        | "/v1/sessions/{id}/suggestions/{sid}/dismiss"
+            if method == Method::POST =>
+        {
+            ClipEdit
+        }
         "/v1/streamer-info" | "/v1/streamer-info/files/{id}" if get => StreamerView,
+        "/v1/sessions/{id}" if method == Method::PATCH || method == Method::DELETE => ClipEdit,
         "/v1/upload/streamers" | "/v1/upload/streamers/{id}" if get => StreamerView,
         "/v1/upload/streamers" if method == Method::POST => TemplateEdit,
         "/v1/upload/streamers/{id}" if method == Method::DELETE => TemplateEdit,
@@ -158,19 +323,97 @@ pub fn required_permission(method: &Method, route: &str, raw_path: &str) -> Opti
         "/v1/login_by_qrcode" if method == Method::POST => AccountManage,
         "/bili/archive/pre" if get => UploadSubmit,
         "/v1/uploads" if method == Method::POST => UploadSubmit,
-        "/v1/videos" if get => FileView,
+        "/v1/videos"
+        | "/v1/activity-events"
+        | "/v1/files/location"
+        | "/v1/upload-queue"
+        | "/v1/upload-queue/{id}"
+            if get =>
+        {
+            FileView
+        }
+        "/v1/files/reveal" if method == Method::POST => FileView,
+        "/v1/session-merge-candidates" if get => ClipEdit,
+        "/v1/session-groups"
+        | "/v1/session-merge-candidates/{id}/confirm"
+        | "/v1/session-merge-candidates/{id}/dismiss"
+            if method == Method::POST =>
+        {
+            ClipEdit
+        }
         "/v1/status" if get => StreamerView,
         // 三个角色都有 StreamerView，等于登录即可
         "/v1/tools" if get => StreamerView,
         "/v1/ws/logs" if get => LogView,
         "/static/{path}" if get => {
+            // 处理函数按百分号解码后的文件名取文件，这里也要按解码后的判断：
+            // 否则 `/static/ds%5Fupdate.log` 读到的是日志，却只按录像的 file.view 放行
             let name = raw_path.rsplit('/').next().unwrap_or_default();
-            if crate::server::router::ALLOWED_LOG_FILES.contains(&name) {
+            let name = urlencoding::decode(name).unwrap_or_default();
+            if crate::server::router::ALLOWED_LOG_FILES.contains(&&*name) {
                 LogView
             } else {
                 FileView
             }
         }
+        // Fleet 控制面：节点、房间、模板、账号、告警与汇总的查看与 /v1/status 同级，管理、分派与清除告警归 node.manage
+        "/v1/fleet/nodes"
+        | "/v1/fleet/rooms"
+        | "/v1/fleet/templates"
+        | "/v1/fleet/accounts"
+        | "/v1/fleet/alerts"
+        | "/v1/fleet/summary"
+        | "/v1/fleet/ha"
+        | "/v1/node/ha"
+        | "/v1/fleet/ha/candidates"
+        | "/v1/node/ha/candidates"
+            if get =>
+        {
+            StreamerView
+        }
+        // 一主一备：指定、解除、换上传主机、改参数、把本地行加入配对与交还的手动动作归 node.manage，场次的人工处理（备机直接投 / 放弃）与投稿同级
+        "/v1/fleet/ha" if method == Method::PUT || method == Method::DELETE => NodeManage,
+        "/v1/node/ha" if method == Method::PUT => NodeManage,
+        "/v1/fleet/ha/role"
+        | "/v1/node/ha/role"
+        | "/v1/fleet/ha/join"
+        | "/v1/node/ha/join"
+        | "/v1/fleet/ha/handback/{kind}/{id}/{action}"
+            if method == Method::POST =>
+        {
+            NodeManage
+        }
+        "/v1/fleet/ha/sessions/{key}/{action}" | "/v1/node/ha/sessions/{key}/{action}"
+            if method == Method::POST =>
+        {
+            UploadSubmit
+        }
+        // Fleet 配置只含白名单字段，查看与空间配置同级；修改会下发到节点，归 node.manage
+        "/v1/fleet/configuration"
+        | "/v1/fleet/configuration/history"
+        | "/v1/fleet/nodes/{id}/config"
+            if get =>
+        {
+            ConfigView
+        }
+        "/v1/fleet/configuration" | "/v1/fleet/nodes/{id}/config" => NodeManage,
+        "/v1/fleet/nodes/{id}"
+        | "/v1/fleet/local-node"
+        | "/v1/fleet/nodes/{id}/labels"
+        | "/v1/fleet/alerts"
+        | "/v1/fleet/alerts/{id}"
+        | "/v1/fleet/join-tokens"
+        | "/v1/fleet/join-tokens/{id}"
+        | "/v1/fleet/rooms"
+        | "/v1/fleet/rooms/{id}"
+        | "/v1/fleet/rooms/{id}/assign"
+        | "/v1/fleet/rooms/{id}/force"
+        | "/v1/fleet/rooms/{id}/pause"
+        | "/v1/fleet/templates"
+        | "/v1/fleet/templates/{id}" => NodeManage,
+        // 被控制面移除过的机器：恢复暂停中的原受管主播，与暂停 / 恢复单个主播同级
+        "/v1/node/revoked/resume" if method == Method::POST => RecordingControl,
+        "/v1/node/revoked" if method == Method::DELETE => RecordingControl,
         "/v1/web-users"
         | "/v1/web-users/roles"
         | "/v1/web-users/{id}"
@@ -209,6 +452,9 @@ mod tests {
             include_str!("../router.rs"),
             include_str!("../app.rs"),
             include_str!("../api/web_users.rs"),
+            include_str!("../api/fleet.rs"),
+            include_str!("../api/fleet_ha.rs"),
+            include_str!("../api/douyu_validation.rs"),
         ];
         // 这些路由有意不挂权限层：登录相关对外公开，`/v1/me*` 只要求登录。
         let unguarded = [
@@ -219,7 +465,13 @@ mod tests {
             "/v1/me",
             "/v1/me/password",
         ];
-        let methods = [Method::GET, Method::POST, Method::PUT, Method::DELETE];
+        let methods = [
+            Method::GET,
+            Method::POST,
+            Method::PUT,
+            Method::PATCH,
+            Method::DELETE,
+        ];
         let mut seen = 0;
         for source in sources {
             for route in registered_routes(non_test_source(source)) {
@@ -244,11 +496,23 @@ mod tests {
         for permission in Permission::ALL {
             assert!(Role::Admin.has(*permission));
         }
-        for permission in [StreamerHooks, AccountManage, ConfigEdit, UserManage] {
+        for permission in [
+            StreamerHooks,
+            AccountManage,
+            ConfigEdit,
+            UserManage,
+            NodeManage,
+        ] {
             assert!(!Role::Operator.has(permission), "{permission:?}");
             assert!(!Role::Viewer.has(permission), "{permission:?}");
         }
-        for permission in [RecordingControl, StreamerEdit, UploadSubmit, TemplateEdit] {
+        for permission in [
+            RecordingControl,
+            StreamerEdit,
+            UploadSubmit,
+            TemplateEdit,
+            ClipEdit,
+        ] {
             assert!(Role::Operator.has(permission), "{permission:?}");
             assert!(!Role::Viewer.has(permission), "{permission:?}");
         }
@@ -256,6 +520,29 @@ mod tests {
             assert!(Role::Operator.has(permission), "{permission:?}");
             assert!(Role::Viewer.has(permission), "{permission:?}");
         }
+    }
+
+    #[test]
+    fn validating_douyu_credentials_requires_configuration_editing() {
+        assert_eq!(
+            required_permission(
+                &Method::POST,
+                "/v1/douyu/validate-cookie",
+                "/v1/douyu/validate-cookie",
+            ),
+            Some(Permission::ConfigEdit)
+        );
+        for role in Role::ALL {
+            assert_eq!(role.has(Permission::ConfigEdit), role == Role::Admin);
+        }
+        assert_eq!(
+            required_permission(
+                &Method::GET,
+                "/v1/douyu/validate-cookie",
+                "/v1/douyu/validate-cookie",
+            ),
+            None
+        );
     }
 
     #[test]
@@ -268,6 +555,67 @@ mod tests {
             required_permission(&Method::GET, "/static/{path}", "/static/a.flv"),
             Some(Permission::FileView)
         );
+    }
+
+    /// `Path` 提取器会做百分号解码，编码过的日志文件名也得按日志判断
+    #[test]
+    fn static_route_classifies_the_decoded_file_name() {
+        for raw in [
+            "/static/ds%5Fupdate.log",
+            "/static/%64ownload.log",
+            "/static/upload%2Elog",
+        ] {
+            assert_eq!(
+                required_permission(&Method::GET, "/static/{path}", raw),
+                Some(Permission::LogView),
+                "{raw}"
+            );
+        }
+        assert_eq!(
+            required_permission(&Method::GET, "/static/{path}", "/static/%E5%BD%95.flv"),
+            Some(Permission::FileView)
+        );
+    }
+
+    #[test]
+    fn ha_pairing_is_node_manage_and_manual_handling_is_upload_submit() {
+        let of = |method: Method, route: &str| required_permission(&method, route, route);
+        assert_eq!(
+            of(Method::GET, "/v1/fleet/ha"),
+            Some(Permission::StreamerView)
+        );
+        assert_eq!(
+            of(Method::GET, "/v1/node/ha"),
+            Some(Permission::StreamerView)
+        );
+        assert_eq!(
+            of(Method::PUT, "/v1/fleet/ha"),
+            Some(Permission::NodeManage)
+        );
+        assert_eq!(
+            of(Method::DELETE, "/v1/fleet/ha"),
+            Some(Permission::NodeManage)
+        );
+        for route in [
+            "/v1/fleet/ha/sessions/{key}/{action}",
+            "/v1/node/ha/sessions/{key}/{action}",
+        ] {
+            assert_eq!(of(Method::POST, route), Some(Permission::UploadSubmit));
+            assert_eq!(of(Method::GET, route), None);
+        }
+        assert_eq!(of(Method::POST, "/v1/node/ha"), None);
+        for route in ["/v1/fleet/ha/candidates", "/v1/node/ha/candidates"] {
+            assert_eq!(of(Method::GET, route), Some(Permission::StreamerView));
+            assert_eq!(of(Method::POST, route), None);
+        }
+        for route in [
+            "/v1/fleet/ha/join",
+            "/v1/node/ha/join",
+            "/v1/fleet/ha/handback/{kind}/{id}/{action}",
+        ] {
+            assert_eq!(of(Method::POST, route), Some(Permission::NodeManage));
+            assert_eq!(of(Method::GET, route), None);
+        }
     }
 
     /// `export type <name> = 'a' | 'b'` 里的字符串字面量；单行或每行一个 `| 'x'` 都行。

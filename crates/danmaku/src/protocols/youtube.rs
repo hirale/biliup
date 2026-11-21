@@ -205,7 +205,8 @@ impl Platform for YouTube {
     ) -> Result<Vec<DanmakuEvent>> {
         let continuation = context
             .extra
-            .remove("continuation")
+            .get("continuation")
+            .cloned()
             .ok_or_else(|| DanmakuError::Decode("YouTube continuation missing".to_string()))?;
 
         let body = json!({
@@ -327,16 +328,7 @@ fn youtube_client_version() -> String {
 
 fn liveparam(video_id: &str, channel_id: &str, past_sec: u64, topchat_only: bool) -> String {
     let times = liveparam_times(past_sec);
-    build_liveparam(
-        video_id,
-        channel_id,
-        times[0],
-        times[1],
-        times[2],
-        times[3],
-        times[4],
-        topchat_only,
-    )
+    build_liveparam(video_id, channel_id, times, topchat_only)
 }
 
 fn liveparam_times(past_sec: u64) -> [u64; 5] {
@@ -354,11 +346,7 @@ fn liveparam_times(past_sec: u64) -> [u64; 5] {
 fn build_liveparam(
     video_id: &str,
     channel_id: &str,
-    ts1: u64,
-    ts2: u64,
-    ts3: u64,
-    ts4: u64,
-    ts5: u64,
+    [ts1, ts2, ts3, ts4, ts5]: [u64; 5],
     topchat_only: bool,
 ) -> String {
     let chat_type = if topchat_only { 4 } else { 1 };

@@ -1,5 +1,6 @@
 'use client'
-import React, { useRef, useState } from 'react'
+import React, { Suspense, useRef, useState } from 'react'
+import { useRouter, useSearchParams } from 'next/navigation'
 import { flushSync } from 'react-dom'
 import {
   Button,
@@ -11,7 +12,7 @@ import {
   Tabs,
   TabPane,
 } from '@douyinfe/semi-ui'
-import { IconPlusCircle, IconStar } from '@douyinfe/semi-icons'
+import { IconKey, IconPlusCircle, IconStar } from '@douyinfe/semi-icons'
 import useSWR from 'swr'
 import { fetcher, put } from '@/app/lib/api-streamer'
 import useSWRMutation from 'swr/mutation'
@@ -25,6 +26,9 @@ import PageHeader from '../components/PageHeader'
 import { PlatformPanels } from '../../ui/plugins'
 import Global from '../../ui/plugins/global'
 import Developer from '../../ui/plugins/developer'
+import LocalSecretsSheet, { ManagedConfigBanner, PairConfigBanner } from './LocalSecretsSheet'
+import AutoClip, { normalizeAutoClip } from '../../ui/plugins/auto-clip'
+import { autoClipError } from '../../lib/auto-clip'
 
 const TAB_GLOBAL = '1'
 const TAB_PLATFORM = '2'
@@ -44,7 +48,7 @@ const fieldElement = (path: string) =>
   document.querySelector<HTMLElement>(`.semi-form-field[x-field-id="${path}"]`)
 
 const Dashboard: React.FC = () => {
-const { data: entity, error, isLoading } = useSWR('/v1/configuration', fetcher)
+const { data: entity, error, isLoading, mutate } = useSWR('/v1/configuration', fetcher)
   const { trigger } = useSWRMutation('/v1/configuration', put)
   const formRef = useRef<FormApi>(undefined)
   // const [formKey, setFormKey] = useState(0); // 初始化一个key
@@ -73,9 +77,18 @@ const { data: entity, error, isLoading } = useSWR('/v1/configuration', fetcher)
   // }, [entity]);
 
   const { biliUsers } = useBiliUsers()
-  const { can } = useMe()
+  const { can, me } = useMe()
+  // 加入了控制面、配置由控制面下发的节点：整页只读，本机密钥在本页的抽屉里保存（/dashboard?secrets=1）
+  const managedBy = me?.fleet_node?.config ? me.fleet_node.controller : null
+  // 一主一备里的节点：控制面不再下发配置，本机照常保存，改动与对端双向同步
+  const pair = me?.fleet_node?.pair
   // 非超管拿到的是脱敏后的配置（凭据、账号 Cookie 等为空），只读展示，不能保存
-  const editable = can('config.edit')
+  const editable = can('config.edit') && !managedBy
+
+  const router = useRouter()
+  const searchParams = useSearchParams()
+  const secretsOpen = searchParams.get('secrets') === '1' && !!managedBy && can('config.edit')
+  const [formKey, setFormKey] = useState(0)
 
   // 平台设置：左列平台名是唯一的导航，右栏只显示选中平台的字段。列表来自插件注册表 PlatformPanels
   const [activePlatform, setActivePlatform] = useState(PlatformPanels[0].key)
@@ -131,13 +144,18 @@ const { data: entity, error, isLoading } = useSWR('/v1/configuration', fetcher)
       <PageHeader
         icon={<IconStar size="large" />}
         title="空间配置"
-        description={
-          editable
-            ? '全局下载 / 上传参数、各平台录制参数与开发者选项。修改后需点击右上角「保存」才会生效'
-            : '只读：当前角色可以查看配置，敏感字段已隐藏；修改需要超级管理员'
-        }
         actions={
-          editable && <Button
+          managedBy ? (
+            can('config.edit') && (
+              <Button
+                icon={<IconKey />}
+                theme="solid"
+                onClick={() => router.replace('/dashboard?secrets=1', { scroll: false })}
+              >
+                本机密钥
+              </Button>
+            )
+          ) : editable && <Button
             onClick={() => {
               formRef.current?.submitForm()
             }}
@@ -150,7 +168,13 @@ const { data: entity, error, isLoading } = useSWR('/v1/configuration', fetcher)
       />
       {/* 页头下方占满剩余高度；每个 Tab 面板在内部滚动，页面本身不滚，「保存」始终可见 */}
       <div className={styles.page}>
+        {managedBy ? (
+          <ManagedConfigBanner controller={managedBy} canEditSecrets={can('config.edit')} />
+        ) : pair && me?.fleet_node ? (
+          <PairConfigBanner controller={me.fleet_node.controller} pair={pair} />
+        ) : null}
         <Form
+          key={formKey}
           className={styles.form}
           initValues={entity}
           disabled={!editable}
@@ -163,13 +187,33 @@ const { data: entity, error, isLoading } = useSWR('/v1/configuration', fetcher)
               if (payload.segment_time === undefined || payload.segment_time === '') {
                 payload.segment_time = null
               }
+              if (payload.min_free_space === undefined || payload.min_free_space === '') {
+                payload.min_free_space = null
+              }
+              if (payload.preview_max_minutes === undefined || payload.preview_max_minutes === '') {
+                payload.preview_max_minutes = null
+              }
+              if (payload.max_upload_limit === undefined || payload.max_upload_limit === '') {
+                payload.max_upload_limit = null
+              }
+              // 后端是非负整数，不接受空值；清空即关闭
+              if (
+                payload.retention_hours === undefined ||
+                payload.retention_hours === '' ||
+                payload.retention_hours === null
+              ) {
+                payload.retention_hours = 0
+              }
+              const autoClip = normalizeAutoClip(payload.auto_clip)
+              if (autoClip === undefined) delete payload.auto_clip
+              else payload.auto_clip = autoClip
               await trigger(payload)
               Toast.success('保存成功')
             } catch (e: any) {
               // error handling
               Notification.error({
                 title: '保存失败',
-                content: <Typography style={{ maxWidth: 450 }}>{e.message}</Typography>,
+                content: <Typography style={{ maxWidth: 450 }}>{autoClipError(e)}</Typography>,
                 // theme: 'light',
                 // duration: 0,
                 style: { width: 'min-content' },
@@ -183,7 +227,8 @@ const { data: entity, error, isLoading } = useSWR('/v1/configuration', fetcher)
           <Tabs type="line" className={styles.tabs} activeKey={activeTab} onChange={setActiveTab}>
             <TabPane tab="全局设置" itemKey={TAB_GLOBAL}>
               <div className={styles.pane} data-tab={TAB_GLOBAL}>
-                <Global />
+                <Global disabled={!editable} />
+                <AutoClip disabled={!editable} entity={entity} />
               </div>
             </TabPane>
             <TabPane tab="平台设置" itemKey={TAB_PLATFORM}>
@@ -230,8 +275,25 @@ const { data: entity, error, isLoading } = useSWR('/v1/configuration', fetcher)
           </Tabs>
         </Form>
       </div>
+      {secretsOpen ? (
+        <LocalSecretsSheet
+          entity={entity}
+          list={list}
+          onClose={() => router.replace('/dashboard', { scroll: false })}
+          onSaved={() => {
+            router.replace('/dashboard', { scroll: false })
+            mutate().then(() => setFormKey((key) => key + 1)).catch(() => undefined)
+          }}
+        />
+      ) : null}
     </>
   )
 }
 
-export default Dashboard
+export default function DashboardPage() {
+  return (
+    <Suspense>
+      <Dashboard />
+    </Suspense>
+  )
+}

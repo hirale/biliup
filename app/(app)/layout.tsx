@@ -1,7 +1,7 @@
 'use client'
 import './bg-global.css'
 import { useGlobalBackgroundInit } from '../lib/useGlobalBackground'
-import { useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
 import Link from 'next/link'
 import { usePathname } from 'next/navigation'
@@ -18,6 +18,7 @@ import { formatVersion } from '../lib/status'
 import { SLOW_REFRESH_MS } from '../lib/use-dashboard'
 import { useIsMobile } from '../lib/useIsMobile'
 import styles from './layout.module.scss'
+import WorkbenchNavigation from '../ui/WorkbenchNavigation'
 
 /* ============ 导航信息架构:5 组 10 项,按当前角色的权限点过滤 ============ */
 
@@ -30,7 +31,16 @@ function Ic({ d, extra }: { d: string; extra?: string }) {
   )
 }
 
-type NavItem = { href: string; label: string; icon: ReactNode; perm: Permission }
+/**
+ * `activeOn`：从这一项进去的子页面（不在侧栏里），停在这些页面时这一项也高亮
+ */
+type NavItem = {
+  href: string
+  label: string
+  icon: ReactNode
+  perm: Permission
+  activeOn?: string[]
+}
 
 const NAV_GROUPS: { title: string; items: NavItem[] }[] = [
   {
@@ -39,8 +49,14 @@ const NAV_GROUPS: { title: string; items: NavItem[] }[] = [
       {
         href: '/',
         perm: 'streamer.view',
-        label: '控制台',
+        label: '概览',
         icon: <Ic d="M4 4h6v6H4zM14 4h6v6h-6zM4 14h6v6H4zM14 14h6v6h-6z" />,
+      },
+      {
+        href: '/monitor',
+        perm: 'preview.view',
+        label: '监控大屏',
+        icon: <Ic d="M3 4h18v13H3zM8 21h8M12 17v4" extra="M7 8h3v3H7zM14 8h3v3h-3z" />,
       },
     ],
   },
@@ -54,16 +70,24 @@ const NAV_GROUPS: { title: string; items: NavItem[] }[] = [
         icon: <Ic d="M3 6h13v12H3zM16 9.5l5-2.5v10l-5-2.5" />,
       },
       {
-        href: '/history',
+        href: '/sessions',
         perm: 'file.view',
-        label: '历史记录',
-        icon: <Ic d="M4 6h16M4 12h16M4 18h10" extra="M18 15v4m0 0l-2-2m2 2l2-2" />,
+        label: '直播场次',
+        icon: <Ic d="M4 5h16v16H4zM4 10h16M8 3v4M16 3v4M8 14h3M8 17h6" />,
       },
       {
-        href: '/job',
-        perm: 'streamer.view',
-        label: '直播历史',
-        icon: <Ic d="M12 7v5l3 2" extra="M12 21a9 9 0 110-18 9 9 0 010 18z" />,
+        href: '/workbench',
+        perm: 'file.view',
+        label: '剪辑台',
+        activeOn: ['/replay'],
+        icon: <Ic d="M6 9a3 3 0 100-6 3 3 0 000 6zM6 21a3 3 0 100-6 3 3 0 000 6z" extra="M20 4L8.1 15.9M14.5 14.5L20 20M8.1 8.1L12 12" />,
+      },
+      {
+        href: '/outputs',
+        perm: 'file.view',
+        label: '压制与导出',
+        activeOn: ['/renders'],
+        icon: <Ic d="M4 3h16v18H4zM4 8h16M4 16h16M8 3v5M16 3v5M8 16v5M16 16v5" />,
       },
     ],
   },
@@ -77,6 +101,12 @@ const NAV_GROUPS: { title: string; items: NavItem[] }[] = [
         icon: <Ic d="M12 16V4m0 0L8 8m4-4l4 4" extra="M4 17v2a1 1 0 001 1h14a1 1 0 001-1v-2" />,
       },
       {
+        href: '/upload-queue',
+        perm: 'file.view',
+        label: '上传队列',
+        icon: <Ic d="M4 6h12M4 12h12M4 18h8" extra="M19 12v8m0-8l-3 3m3-3l3 3" />,
+      },
+      {
         href: '/archives',
         perm: 'account.manage',
         label: 'B站稿件',
@@ -87,6 +117,7 @@ const NAV_GROUPS: { title: string; items: NavItem[] }[] = [
   {
     title: '设置',
     items: [
+      { href: '/runtime', perm: 'streamer.view', label: '运行状态', icon: <Ic d="M3 12h4l3-8 4 16 3-8h4" /> },
       {
         href: '/dashboard',
         perm: 'config.view',
@@ -99,15 +130,10 @@ const NAV_GROUPS: { title: string; items: NavItem[] }[] = [
     title: '系统',
     items: [
       {
-        href: '/logviewer',
-        perm: 'log.view',
-        label: '实时日志',
-        icon: <Ic d="M4 5h16M4 12h16M4 19h10" extra="M18 15l3 3-3 3" />,
-      },
-      {
         href: '/status',
         perm: 'streamer.view',
         label: '任务平台',
+        activeOn: ['/nodes'],
         icon: <Ic d="M4 4h16v16H4z" extra="M4 9h16M9 4v5" />,
       },
       {
@@ -127,8 +153,15 @@ const NAV_GROUPS: { title: string; items: NavItem[] }[] = [
 
 /** 不在侧栏里、但同样需要权限的子页面（按前缀匹配，先匹配到的生效） */
 const EXTRA_PAGE_PERMS: { prefix: string; perm: Permission }[] = [
+  { prefix: '/runtime/logs', perm: 'log.view' },
+  { prefix: '/logviewer', perm: 'log.view' },
+  { prefix: '/nodes', perm: 'streamer.view' },
+  { prefix: '/live', perm: 'preview.view' },
   { prefix: '/upload-manager/add', perm: 'template.edit' },
   { prefix: '/upload-manager/edit', perm: 'template.edit' },
+  { prefix: '/replay', perm: 'file.view' },
+  { prefix: '/renders', perm: 'file.view' },
+  { prefix: '/outputs', perm: 'file.view' },
 ]
 
 const matches = (pathname: string, href: string) =>
@@ -179,6 +212,137 @@ export default function Layout({ children }: { children: React.ReactNode }) {
   const pathname = usePathname()
   const isMobile = useIsMobile()
   const [mobileNavOpen, setMobileNavOpen] = useState(false)
+  const [passwordOpen, setPasswordOpen] = useState(false)
+  const [accountMenuOpen, setAccountMenuOpen] = useState(false)
+  const asideRef = useRef<HTMLElement>(null)
+  const burgerRef = useRef<HTMLButtonElement>(null)
+  const wasMobileNavOpen = useRef(false)
+  const previousMobileBreakpoint = useRef<boolean | null>(null)
+  const accountMenuEscapeHandled = useRef(false)
+
+  useEffect(() => {
+    if (isMobile && asideRef.current?.contains(document.activeElement)) {
+      burgerRef.current?.focus()
+    }
+  }, [isMobile])
+
+  useEffect(() => {
+    if (!passwordOpen) return
+    const frame = window.requestAnimationFrame(() => {
+      document.querySelector<HTMLInputElement>('input[autocomplete="current-password"]')?.focus()
+    })
+    return () => window.cancelAnimationFrame(frame)
+  }, [passwordOpen])
+
+  useEffect(() => {
+    const syncResponsiveState = () => {
+      const mobileWidth = window.innerWidth <= 640
+      if (previousMobileBreakpoint.current !== null && previousMobileBreakpoint.current !== mobileWidth) {
+        setMobileNavOpen(false)
+        setAccountMenuOpen(false)
+      }
+      previousMobileBreakpoint.current = mobileWidth
+    }
+    syncResponsiveState()
+    window.addEventListener('resize', syncResponsiveState)
+    return () => window.removeEventListener('resize', syncResponsiveState)
+  }, [])
+
+  useEffect(() => {
+    if (!isMobile) {
+      wasMobileNavOpen.current = false
+      return
+    }
+    if (mobileNavOpen && !wasMobileNavOpen.current) {
+      const firstNavItem = asideRef.current?.querySelector<HTMLElement>('nav a[href]')
+      const initialFocusTarget = firstNavItem ?? asideRef.current
+      initialFocusTarget?.focus()
+    } else if (!mobileNavOpen && wasMobileNavOpen.current && !passwordOpen) {
+      burgerRef.current?.focus()
+    }
+    wasMobileNavOpen.current = mobileNavOpen
+  }, [isMobile, mobileNavOpen, passwordOpen])
+
+  useEffect(() => {
+    if (!isMobile || !mobileNavOpen) return
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        // Dropdown/Modal portals handle Escape first; leave their overlay open
+        // state intact instead of closing the drawer underneath them.
+        if (accountMenuEscapeHandled.current) {
+          accountMenuEscapeHandled.current = false
+          return
+        }
+        if (
+          event.defaultPrevented ||
+          event.cancelBubble ||
+          (event.target instanceof Element && event.target.closest('[role="menu"]'))
+        ) {
+          return
+        }
+        event.preventDefault()
+        setMobileNavOpen(false)
+        return
+      }
+      if (event.key !== 'Tab') return
+
+      const aside = asideRef.current
+      if (!aside) return
+      // Semi Dropdown renders its menu in a body portal. The trigger's
+      // aria-describedby relation identifies that popup for the focus order.
+      const dropdownTrigger = aside.querySelector<HTMLElement>('button[aria-haspopup="true"][aria-describedby]')
+      const popupId = dropdownTrigger?.getAttribute('aria-describedby')
+      const popup = popupId ? document.getElementById(popupId) : null
+      const popupOpen = !!popup && popup.getClientRects().length > 0
+      const popupItems = popupOpen && popup
+        ? Array.from(popup.querySelectorAll<HTMLElement>('[role="menuitem"]')).filter(
+            (element) => element.getClientRects().length > 0,
+          )
+        : []
+      const focusable = [
+        ...(burgerRef.current ? [burgerRef.current] : []),
+        ...Array.from(
+          aside.querySelectorAll<HTMLElement>(
+            'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])',
+          ),
+        ),
+      ]
+      const triggerIndex = popupOpen && dropdownTrigger ? focusable.indexOf(dropdownTrigger) : -1
+      if (triggerIndex >= 0) focusable.splice(triggerIndex, 1, ...popupItems)
+      else if (popupOpen) focusable.push(...popupItems)
+      const visibleFocusable = focusable.filter(
+        (element) => element.getAttribute('aria-hidden') !== 'true' && element.getClientRects().length > 0,
+      )
+      if (!visibleFocusable.length) {
+        event.preventDefault()
+        aside.focus()
+        return
+      }
+
+      const activeIndex = visibleFocusable.indexOf(document.activeElement as HTMLElement)
+      const outsideDialog =
+        !aside.contains(document.activeElement) &&
+        !popup?.contains(document.activeElement) &&
+        document.activeElement !== burgerRef.current
+      if (popupOpen && popup?.contains(document.activeElement) && activeIndex >= 0) {
+        const nextIndex = activeIndex + (event.shiftKey ? -1 : 1)
+        if (nextIndex >= 0 && nextIndex < visibleFocusable.length) {
+          event.preventDefault()
+          visibleFocusable[nextIndex].focus()
+          return
+        }
+      }
+      if (event.shiftKey && (activeIndex === 0 || outsideDialog)) {
+        event.preventDefault()
+        visibleFocusable[visibleFocusable.length - 1].focus()
+      } else if (!event.shiftKey && (activeIndex === visibleFocusable.length - 1 || outsideDialog)) {
+        event.preventDefault()
+        visibleFocusable[0].focus()
+      }
+    }
+    window.addEventListener('keydown', handleKeyDown)
+    return () => window.removeEventListener('keydown', handleKeyDown)
+  }, [isMobile, mobileNavOpen])
 
   useGlobalBackgroundInit()
 
@@ -204,26 +368,35 @@ export default function Layout({ children }: { children: React.ReactNode }) {
 
   const navCollapsed = !isMobile && collapsed
 
-  const isActive = (href: string) => matches(pathname, href)
+  const isActive = (item: NavItem) =>
+    matches(pathname, item.href) || !!item.activeOn?.some((href) => matches(pathname, href))
 
   // 权限未加载完时整组菜单先不过滤（全部都是公开的静态页面，数据接口本身有后端拦截），
   // 避免每次进页面侧栏闪一下
   const { me, error: meError, can } = useMe()
   const visibleGroups = me
-    ? NAV_GROUPS.map((group) => ({ ...group, items: group.items.filter((item) => can(item.perm)) })).filter(
-        (group) => group.items.length > 0,
-      )
-    : NAV_GROUPS.map((group) => ({ ...group, items: group.items.filter((item) => item.perm !== 'user.manage') }))
+    ? NAV_GROUPS.map((group) => ({
+        ...group,
+        items: group.items.filter(item => can(item.perm)||(item.href==='/runtime'&&can('log.view')))
+          .map(item=>item.href==='/runtime'&&!can('streamer.view')?{...item,href:'/runtime/logs'}:item),
+      })).filter((group) => group.items.length > 0)
+    : NAV_GROUPS.map((group) => ({
+        ...group,
+        items: group.items.filter((item) => item.perm !== 'user.manage'),
+      }))
   const requiredPerm = pagePermission(pathname)
   const denied = !!me && !!requiredPerm && !can(requiredPerm)
   // 需要权限的页面一律等权限加载完再渲染：前端不假设哪个权限点人人都有，
   // 免得没有权限的人先发出一串注定 403 的请求。/v1/me 有缓存，只有首次进入会等
   const pending = !me && !meError && !!requiredPerm
 
-  const [passwordOpen, setPasswordOpen] = useState(false)
+  const openPasswordDialog = () => {
+    if (isMobile) setMobileNavOpen(false)
+    setPasswordOpen(true)
+  }
   const logout = async () => {
     try {
-      await fetch(`${API_BASE}/v1/logout`, { method: 'POST' })
+      await fetch(`${API_BASE}/v1/logout`, { method: 'POST', credentials: 'include' })
     } finally {
       window.location.assign('/login')
     }
@@ -234,15 +407,19 @@ export default function Layout({ children }: { children: React.ReactNode }) {
 
   return (
     <div className={styles.app}>
-      {/* 移动端:汉堡按钮 + 遮罩(抽屉打开时隐藏汉堡,点击其位置即点遮罩关闭) */}
-      {isMobile && !mobileNavOpen && (
+      {/* 移动端汉堡按钮兼作抽屉关闭按钮，遮罩点击也可关闭 */}
+      {isMobile && (
         <button
-          className={styles.burger}
-          onClick={() => setMobileNavOpen(true)}
-          aria-label="打开导航"
+          ref={burgerRef}
+          type="button"
+          className={`${styles.burger} ${mobileNavOpen ? styles.burgerOpen : ''}`}
+          onClick={() => setMobileNavOpen((open) => !open)}
+          aria-label={mobileNavOpen ? '关闭导航' : '打开导航'}
+          aria-expanded={mobileNavOpen}
+          aria-controls="app-mobile-navigation"
         >
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
-            <path d="M4 7h16M4 12h16M4 17h16" />
+            {mobileNavOpen ? <path d="M6 6l12 12M18 6L6 18" /> : <path d="M4 7h16M4 12h16M4 17h16" />}
           </svg>
         </button>
       )}
@@ -251,9 +428,17 @@ export default function Layout({ children }: { children: React.ReactNode }) {
       )}
 
       <aside
+        ref={asideRef}
+        id="app-mobile-navigation"
         className={`${styles.sider} ${navCollapsed ? styles.collapsed : ''} ${
           isMobile ? styles.siderMobile : ''
         } ${mobileNavOpen ? styles.open : ''}`}
+        role={isMobile && mobileNavOpen ? 'dialog' : undefined}
+        aria-label={isMobile && mobileNavOpen ? '主导航' : undefined}
+        aria-modal={isMobile && mobileNavOpen && !accountMenuOpen ? true : undefined}
+        aria-hidden={isMobile && !mobileNavOpen ? true : undefined}
+        inert={isMobile && !mobileNavOpen}
+        tabIndex={isMobile && mobileNavOpen ? -1 : undefined}
       >
         {/* 品牌区 */}
         <div className={styles.brand}>
@@ -261,7 +446,7 @@ export default function Layout({ children }: { children: React.ReactNode }) {
             href="/"
             prefetch={false}
             onClick={() => isMobile && setMobileNavOpen(false)}
-            aria-label="回到控制台"
+            aria-label="回到概览"
           >
             <Image
               src="/logo.png"
@@ -295,7 +480,9 @@ export default function Layout({ children }: { children: React.ReactNode }) {
             <div key={group.title} className={styles.group}>
               {!navCollapsed && <div className={styles.groupTitle}>{group.title}</div>}
               {group.items.map((item) => {
-                const active = isActive(item.href)
+                const active = isActive(item)
+                if (item.href === '/workbench') return <WorkbenchNavigation key={item.href} icon={item.icon}
+                  collapsed={navCollapsed} expand={() => setSiderPref('0')} onNavigate={() => isMobile && setMobileNavOpen(false)} />
                 return (
                   <Link
                     key={item.href}
@@ -319,13 +506,22 @@ export default function Layout({ children }: { children: React.ReactNode }) {
           {showUser && (
             <Dropdown
               trigger="click"
+              clickToHide
+              visible={accountMenuOpen}
+              onVisibleChange={setAccountMenuOpen}
+              onEscKeyDown={() => {
+                accountMenuEscapeHandled.current = true
+                window.setTimeout(() => {
+                  accountMenuEscapeHandled.current = false
+                }, 0)
+              }}
               position={navCollapsed ? 'rightBottom' : 'topLeft'}
               render={
                 <Dropdown.Menu>
                   <Dropdown.Title>
                     {username} · {roleLabel}
                   </Dropdown.Title>
-                  <Dropdown.Item onClick={() => setPasswordOpen(true)}>修改密码</Dropdown.Item>
+                  <Dropdown.Item onClick={openPasswordDialog}>修改密码</Dropdown.Item>
                   <Dropdown.Divider />
                   <Dropdown.Item type="danger" onClick={logout}>
                     退出登录
@@ -375,7 +571,7 @@ export default function Layout({ children }: { children: React.ReactNode }) {
         </div>
       </aside>
 
-      <main className={styles.main}>
+      <main className={styles.main} inert={isMobile && mobileNavOpen} aria-hidden={isMobile && mobileNavOpen ? true : undefined}>
         {pending ? (
           <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
             <Spin size="large" />
@@ -393,7 +589,12 @@ export default function Layout({ children }: { children: React.ReactNode }) {
           children
         )}
       </main>
-      {showUser && <ChangePasswordModal visible={passwordOpen} onClose={() => setPasswordOpen(false)} />}
+      {showUser && (
+        <ChangePasswordModal
+          visible={passwordOpen}
+          onClose={() => setPasswordOpen(false)}
+        />
+      )}
     </div>
   )
 }

@@ -17,15 +17,16 @@
 //! （已完成 GOP + 当前 GOP）最多 [`MAX_SNAPSHOT_BYTES`]，超过就先丢最旧的 GOP；
 //! 广播缓冲按格式固定槽位数（[`BROADCAST_CAPACITY_FLV`] / [`BROADCAST_CAPACITY_SEGMENTED`]），
 //! 每槽最多 [`MAX_CHUNK_BYTES`]（更大的分块会被切开），
-//! 且只在有订阅者时才占用。订阅者数量由信号量限制（[`PreviewHub::new`] 的参数）。
+//! 且只在有订阅者时才占用。订阅者数量是固定槽位（[`PreviewHub::new`] 的参数，见 [`PreviewSlots`]）：
+//! 满了由 HTTP 订阅路径决定拒绝新来的还是挤掉最早的一条，写入端不参与。
 
 use bytes::Bytes;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc as std_mpsc;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock};
 use std::time::{Duration, Instant};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, broadcast, oneshot};
+use tokio::sync::{broadcast, oneshot, watch};
 use tracing::debug;
 
 /// 每路直播默认允许同时观看的预览连接数。
@@ -116,11 +117,228 @@ pub struct PreviewStatus {
     /// 当前下载器能否提供预览（`true` 时 `format` 可能仍为 `None`：刚开始拉流、尚未确定容器）
     pub available: bool,
     pub format: Option<PreviewFormat>,
-    /// fMP4 时从 init segment 的 `moov` 解出的 RFC 6381 编码串（如 `avc1.64001f,mp4a.40.2`），
-    /// 供前端 `MediaSource.isTypeSupported()` 校验并 `addSourceBuffer`；其它容器为 `None`
+    /// 从初始化数据解出的 RFC 6381 编码串（如 `avc1.64001f,mp4a.40.2`）。
+    /// FLV / TS 在能读到序列头或 SPS 时也提供；未知时等待初始化，不推断为不支持。
     pub codecs: Option<String>,
     /// 不可预览的原因，面向用户的中文说明
     pub reason: Option<String>,
+    /// 此刻占着该路槽位的预览连接数
+    pub subscribers: usize,
+    /// 该路的槽位数；不可预览的 hub 为 0
+    pub max_subscribers: usize,
+}
+
+/// 预览许可池所在的层级，决定满员时挤掉的范围与说明文字。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SlotScope {
+    /// 单个直播间（[`PreviewHub`] 自己的槽位）
+    Room,
+    /// 整个进程（所有直播间合计）
+    Process,
+}
+
+impl SlotScope {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SlotScope::Room => "该直播间",
+            SlotScope::Process => "进程内",
+        }
+    }
+}
+
+/// 一条预览连接为什么被服务端结束（而不是客户端断开 / 写入端换代）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TicketEnd {
+    /// 满员时被新连接挤掉，附挤掉它的那一级
+    Evicted(SlotScope),
+    /// 客户端声明不再需要（播放器销毁时主动释放）
+    Released,
+    /// 客户端的租约没了（心跳超时 / 心跳连接断开）
+    LeaseLost,
+}
+
+/// 一条预览连接在各级许可池里的身份。服务端要结束这条连接（池满被挤掉、客户端释放、
+/// 租约丢失）时通过它通知，响应随之结束。
+///
+/// `Clone` 得到的是同一张票；同一张票可以同时占多个池（直播间 + 进程）的槽位，
+/// 一旦被结束，它在所有池里的槽位都不再计入占用（见 [`PreviewSlots::acquire`]）。
+#[derive(Clone)]
+pub struct PreviewTicket(Arc<TicketInner>);
+
+struct TicketInner {
+    id: u64,
+    opened: Instant,
+    ended: watch::Sender<Option<TicketEnd>>,
+}
+
+impl Default for PreviewTicket {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl std::fmt::Debug for PreviewTicket {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PreviewTicket")
+            .field("id", &self.0.id)
+            .field("ended_by", &self.ended_by())
+            .finish()
+    }
+}
+
+impl PreviewTicket {
+    pub fn new() -> Self {
+        static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+        Self(Arc::new(TicketInner {
+            id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
+            opened: Instant::now(),
+            ended: watch::Sender::new(None),
+        }))
+    }
+
+    /// 进程内唯一的连接编号，日志里用
+    pub fn id(&self) -> u64 {
+        self.0.id
+    }
+
+    /// 拿到这张票（开始占槽位）以来的时长
+    pub fn age(&self) -> Duration {
+        self.0.opened.elapsed()
+    }
+
+    /// 服务端为什么结束了它；还没被结束为 `None`
+    pub fn ended_by(&self) -> Option<TicketEnd> {
+        *self.0.ended.borrow()
+    }
+
+    /// 被服务端结束时完成（已经结束则立刻完成）。可放进 `select!`，丢弃即取消等待。
+    pub async fn ended(&self) -> TicketEnd {
+        let mut rx = self.0.ended.subscribe();
+        let cause = rx.wait_for(Option::is_some).await.ok().and_then(|v| *v);
+        match cause {
+            Some(cause) => cause,
+            // 发送端就在 `self` 里，活得比这个 future 久，走不到这里
+            None => std::future::pending().await,
+        }
+    }
+
+    /// 结束这条连接；已经结束的保留第一次的原因。只改一个 `watch` 值，不等待。
+    pub fn end(&self, cause: TicketEnd) {
+        self.0.ended.send_if_modified(|current| {
+            if current.is_some() {
+                return false;
+            }
+            *current = Some(cause);
+            true
+        });
+    }
+}
+
+/// [`PreviewSlots::acquire`] 挤掉的那条连接。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Evicted {
+    /// 被挤掉的连接编号（[`PreviewTicket::id`]）
+    pub id: u64,
+    /// 它占了多久
+    pub age: Duration,
+}
+
+/// 固定槽位的预览许可池。满员时可以拒绝新连接，也可以挤掉最早进来的那一条：
+/// 服务端看不出客户端是否还在看（经过替客户端读完上游的代理 / 隧道时，关掉播放器 TCP 也不断），
+/// 所以不能指望旧连接自己释放；而用户新打开的预览一定是他此刻想看的。
+///
+/// 只在 HTTP 订阅路径上使用（短暂加锁、挤人都在这里），写入端热路径不碰它。
+#[derive(Clone)]
+pub struct PreviewSlots(Arc<SlotsInner>);
+
+struct SlotsInner {
+    scope: SlotScope,
+    capacity: usize,
+    /// 按拿到槽位的先后排列，队首最早
+    holders: Mutex<VecDeque<PreviewTicket>>,
+}
+
+impl SlotsInner {
+    fn holders(&self) -> MutexGuard<'_, VecDeque<PreviewTicket>> {
+        self.holders.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+impl PreviewSlots {
+    pub fn new(scope: SlotScope, capacity: usize) -> Self {
+        Self(Arc::new(SlotsInner {
+            scope,
+            capacity,
+            holders: Mutex::new(VecDeque::with_capacity(capacity)),
+        }))
+    }
+
+    pub fn scope(&self) -> SlotScope {
+        self.0.scope
+    }
+
+    pub fn capacity(&self) -> usize {
+        self.0.capacity
+    }
+
+    /// 占着槽位的连接数；已被服务端结束（挤掉 / 释放 / 租约丢失）、正在收尾的连接不算
+    pub fn occupied(&self) -> usize {
+        self.0
+            .holders()
+            .iter()
+            .filter(|t| t.ended_by().is_none())
+            .count()
+    }
+
+    /// 为 `ticket` 占一个槽位。满员时：`evict` 为真就挤掉最早进来的那条，把位置让给它；
+    /// 否则返回 `Err(当前占用数)`。已被结束、响应还没来得及收尾的连接不占名额，
+    /// 所以直播间一级挤掉的那条不会让进程一级再多挤一条。
+    pub fn acquire(
+        &self,
+        ticket: &PreviewTicket,
+        evict: bool,
+    ) -> Result<(PreviewSlot, Option<Evicted>), usize> {
+        let mut holders = self.0.holders();
+        holders.retain(|t| t.ended_by().is_none());
+        let mut evicted = None;
+        if holders.len() >= self.0.capacity {
+            if !evict {
+                return Err(holders.len());
+            }
+            let Some(oldest) = holders.pop_front() else {
+                return Err(0);
+            };
+            oldest.end(TicketEnd::Evicted(self.0.scope));
+            evicted = Some(Evicted {
+                id: oldest.id(),
+                age: oldest.age(),
+            });
+        }
+        holders.push_back(ticket.clone());
+        drop(holders);
+        Ok((
+            PreviewSlot {
+                slots: self.0.clone(),
+                ticket: ticket.id(),
+            },
+            evicted,
+        ))
+    }
+}
+
+/// 占着的一个槽位，drop 即归还（被挤掉的连接此时早已不计入占用，归还是空操作）。
+pub struct PreviewSlot {
+    slots: Arc<SlotsInner>,
+    ticket: u64,
+}
+
+impl Drop for PreviewSlot {
+    fn drop(&mut self) {
+        let mut holders = self.slots.holders();
+        if let Some(i) = holders.iter().position(|t| t.id() == self.ticket) {
+            holders.remove(i);
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -131,6 +349,10 @@ enum HubState {
         format: PreviewFormat,
         codecs: Option<String>,
     },
+    /// Media bytes remain available to server decoders, but the browser player
+    /// cannot decode this codec. This is deliberately distinct from missing
+    /// init segments or downloaders that do not tee media at all.
+    BrowserUnavailable(String),
     Unavailable(String),
 }
 
@@ -153,8 +375,7 @@ struct Shared {
     /// 当前写入端的订阅请求入口，`(代数, 发送端)`；没有写入端时为 `None`
     requests: RwLock<Option<(u64, std_mpsc::Sender<SnapshotRequest>)>>,
     generation: AtomicU64,
-    subscribers: Arc<Semaphore>,
-    max_subscribers: usize,
+    subscribers: PreviewSlots,
 }
 
 /// 一路录制的预览 hub，`Clone` 得到的是同一个 hub 的另一个句柄。
@@ -172,7 +393,8 @@ impl std::fmt::Debug for PreviewHub {
         f.debug_struct("PreviewHub")
             .field("state", &*self.0.state.read().unwrap())
             .field("attached", &self.0.requests.read().unwrap().is_some())
-            .field("max_subscribers", &self.0.max_subscribers)
+            .field("subscribers", &self.0.subscribers.occupied())
+            .field("max_subscribers", &self.0.subscribers.capacity())
             .finish()
     }
 }
@@ -184,7 +406,7 @@ pub enum SubscribeError {
     Unavailable(String),
     /// 能预览，但此刻没有写入端（还没开始拉流，或正在断流重试）
     NotAttached,
-    /// 该路的预览连接数已达上限
+    /// 该路的预览连接数已达上限（附上限），且调用方不许挤掉旧连接
     TooManySubscribers(usize),
     /// 等待关键帧超时（流停滞）
     Timeout,
@@ -196,7 +418,7 @@ impl std::fmt::Display for SubscribeError {
             SubscribeError::Unavailable(reason) => write!(f, "当前下载器不支持预览: {reason}"),
             SubscribeError::NotAttached => write!(f, "录制尚未开始拉流或正在重连"),
             SubscribeError::TooManySubscribers(n) => {
-                write!(f, "该直播间的预览连接数已达上限（{n}）")
+                write!(f, "该直播间的预览连接数已达上限（每个直播间最多 {n} 路）")
             }
             SubscribeError::Timeout => write!(f, "等待关键帧超时"),
         }
@@ -207,7 +429,7 @@ impl std::error::Error for SubscribeError {}
 
 /// 一个预览订阅：先发 `snapshot` 里的分块，再从 `rx` 取实时分块。
 ///
-/// 持有该路的一个连接许可，drop 即释放；掉队后可用 [`PreviewHub::resubscribe`] 原地重新对齐。
+/// 持有该路的一个槽位，drop 即释放；掉队后可用 [`PreviewHub::resubscribe`] 原地重新对齐。
 pub struct Subscription {
     pub format: PreviewFormat,
     pub snapshot: Vec<Bytes>,
@@ -215,7 +437,7 @@ pub struct Subscription {
     header_len: usize,
     /// 订阅时要的快照深度，掉队重新对齐时沿用
     depth: Option<Duration>,
-    _permit: OwnedSemaphorePermit,
+    _permit: PreviewSlot,
 }
 
 impl Subscription {
@@ -233,8 +455,7 @@ impl PreviewHub {
             state: RwLock::new(HubState::Pending),
             requests: RwLock::new(None),
             generation: AtomicU64::new(0),
-            subscribers: Arc::new(Semaphore::new(max_subscribers)),
-            max_subscribers,
+            subscribers: PreviewSlots::new(SlotScope::Room, max_subscribers),
         }))
     }
 
@@ -251,29 +472,42 @@ impl PreviewHub {
     }
 
     pub fn max_subscribers(&self) -> usize {
-        self.0.max_subscribers
+        self.0.subscribers.capacity()
+    }
+
+    /// 此刻占着该路槽位的预览连接数
+    pub fn subscribers(&self) -> usize {
+        self.0.subscribers.occupied()
     }
 
     /// 当前状态，供 `/v1/streamers` 透出。
     pub fn status(&self) -> PreviewStatus {
+        let subscribers = self.subscribers();
+        let max_subscribers = self.max_subscribers();
         match &*self.0.state.read().unwrap() {
             HubState::Pending => PreviewStatus {
                 available: true,
                 format: None,
                 codecs: None,
                 reason: None,
+                subscribers,
+                max_subscribers,
             },
             HubState::Available { format, codecs } => PreviewStatus {
                 available: true,
                 format: Some(*format),
                 codecs: codecs.clone(),
                 reason: None,
+                subscribers,
+                max_subscribers,
             },
-            HubState::Unavailable(reason) => PreviewStatus {
+            HubState::Unavailable(reason) | HubState::BrowserUnavailable(reason) => PreviewStatus {
                 available: false,
                 format: None,
                 codecs: None,
                 reason: Some(reason.clone()),
+                subscribers,
+                max_subscribers,
             },
         }
     }
@@ -322,25 +556,67 @@ impl PreviewHub {
         self.subscribe_with_depth(None, timeout).await
     }
 
+    /// Subscribe to the latest GOP for a server-side decoder. A browser-only
+    /// codec limitation (e.g. HEVC FLV) is allowed here; unavailable media and
+    /// missing writers still fail. Normal viewer limits and attachment
+    /// generations apply exactly as they do for browser subscriptions.
+    ///
+    /// The caller should copy the snapshot and immediately drop the subscription
+    /// before decoding, rather than keep a live viewer slot occupied.
+    pub async fn subscribe_for_decoder(
+        &self,
+        timeout: Duration,
+    ) -> Result<Subscription, SubscribeError> {
+        let ticket = PreviewTicket::new();
+        let permit = {
+            if let HubState::Unavailable(reason) = &*self.0.state.read().unwrap() {
+                return Err(SubscribeError::Unavailable(reason.clone()));
+            }
+            // BrowserUnavailable is intentional here. subscribe_reserved still
+            // obtains the latest attached writer and rejects missing writers.
+            self.0
+                .subscribers
+                .acquire(&ticket, false)
+                .map_err(|_| SubscribeError::TooManySubscribers(self.max_subscribers()))?
+                .0
+        };
+        self.subscribe_reserved(permit, Some(Duration::ZERO), timeout)
+            .await
+    }
+
     /// 同 [`subscribe`](Self::subscribe)，但快照里的已完成 GOP 只回溯 `depth`：
     /// 从当前 GOP 往前，取到第一个关键帧到达时刻早于「现在 − depth」的 GOP 为止（含），
     /// 所以起播缓冲在 `depth` 到 `depth + 一个 GOP` 之间；`Some(ZERO)` 只给当前 GOP，
     /// `None` 给整个 [`SNAPSHOT_WINDOW`]。播放器要多深的缓冲就要多深的快照，多要的只会被追帧丢掉。
+    ///
+    /// 满员时拒绝（[`SubscribeError::TooManySubscribers`]）；要挤掉最早的连接用
+    /// [`reserve`](Self::reserve) + [`subscribe_reserved`](Self::subscribe_reserved)。
     pub async fn subscribe_with_depth(
         &self,
         depth: Option<Duration>,
         timeout: Duration,
     ) -> Result<Subscription, SubscribeError> {
-        if let HubState::Unavailable(reason) = &*self.0.state.read().unwrap() {
+        let (slot, _) = self.reserve(&PreviewTicket::new(), false)?;
+        self.subscribe_reserved(slot, depth, timeout).await
+    }
+
+    /// 为 `ticket` 占该路一个槽位（不等写入端）。满员时 `evict` 为真就挤掉该路最早的那条连接
+    /// （它的 `ticket` 随之报告被挤掉，由持有者结束响应），并把被挤掉的是谁交回；
+    /// 否则返回 [`SubscribeError::TooManySubscribers`]。不可预览时返回 `Unavailable`。
+    pub fn reserve(
+        &self,
+        ticket: &PreviewTicket,
+        evict: bool,
+    ) -> Result<(PreviewSlot, Option<Evicted>), SubscribeError> {
+        if let HubState::Unavailable(reason) | HubState::BrowserUnavailable(reason) =
+            &*self.0.state.read().unwrap()
+        {
             return Err(SubscribeError::Unavailable(reason.clone()));
         }
-        let permit = self
-            .0
+        self.0
             .subscribers
-            .clone()
-            .try_acquire_owned()
-            .map_err(|_| SubscribeError::TooManySubscribers(self.0.max_subscribers))?;
-        self.subscribe_holding(permit, depth, timeout).await
+            .acquire(ticket, evict)
+            .map_err(|_| SubscribeError::TooManySubscribers(self.max_subscribers()))
     }
 
     /// 掉队（`Lagged`）后原地重新对齐：复用 `previous` 的连接许可与快照深度，向写入端再要一份从最近
@@ -352,12 +628,13 @@ impl PreviewHub {
         timeout: Duration,
     ) -> Result<Subscription, SubscribeError> {
         let Subscription { _permit, depth, .. } = previous;
-        self.subscribe_holding(_permit, depth, timeout).await
+        self.subscribe_reserved(_permit, depth, timeout).await
     }
 
-    async fn subscribe_holding(
+    /// 用 [`reserve`](Self::reserve) 占到的槽位订阅；语义同 [`subscribe_with_depth`](Self::subscribe_with_depth)。
+    pub async fn subscribe_reserved(
         &self,
-        permit: OwnedSemaphorePermit,
+        permit: PreviewSlot,
         depth: Option<Duration>,
         timeout: Duration,
     ) -> Result<Subscription, SubscribeError> {
@@ -444,10 +721,16 @@ impl PreviewSink {
         self.tx.receiver_count()
     }
 
-    /// 写入端在流里发现浏览器放不了的内容（如 HEVC 序列头）时把 hub 标为不可预览。
-    /// 只在序列头出现时调用一次，不在逐 tag 的路径上。
+    /// Media is incomplete/unsupported, so neither browsers nor server decoders
+    /// should subscribe. Browser-only codec limits use mark_browser_unavailable.
     pub fn mark_unavailable(&self, reason: impl Into<String>) {
         *self.hub.state.write().unwrap() = HubState::Unavailable(reason.into());
+    }
+
+    /// The tee contains complete decodable bytes, but the browser player cannot
+    /// handle the codec. Recording and server-side JPEG decoding remain usable.
+    pub fn mark_browser_unavailable(&self, reason: impl Into<String>) {
+        *self.hub.state.write().unwrap() = HubState::BrowserUnavailable(reason.into());
     }
 
     /// 推送一个 fMP4 分段（可能含多个 moof/mdat 对）：按分片切开，视频首帧是关键帧的分片
@@ -471,6 +754,9 @@ impl PreviewSink {
     /// 推送一个 MPEG-TS 分片的起始块：嗅探第一个视频 PES 是否从 IDR 起，是（或说不准）
     /// 就作为 GOP 起点，否则追加到前一个 GOP。
     pub fn push_ts_segment_start(&mut self, chunk: Bytes) {
+        if let Some(codecs) = ts::video_codec(&chunk) {
+            self.set_codecs(Some(codecs));
+        }
         let kind = match ts::segment_starts_with_idr(&chunk) {
             Some(false) => ChunkKind::Media,
             _ => ChunkKind::Keyframe,
@@ -489,6 +775,9 @@ impl PreviewSink {
                     // 旧 GOP 不能再和新 init 一起给新订阅者
                     if self.header.as_ref().is_some_and(|old| *old != chunk) {
                         self.drop_history();
+                        self.gop.clear();
+                        self.gop_bytes = 0;
+                        self.gop_ready = false;
                     }
                     self.fmp4_init = mp4::init_info(&chunk);
                     let codecs = mp4::codecs_from_init(&chunk);
@@ -508,13 +797,32 @@ impl PreviewSink {
                 match self.sequence_headers.iter_mut().find(|(s, _)| *s == slot) {
                     Some(entry) => {
                         // 序列头内容变了（换分辨率 / 编码参数）：之前的 GOP 与新序列头不配，
-                        // 不能再放进快照；当前 GOP 沿用既有行为，与新序列头一起给出
-                        if entry.1 != chunk {
+                        // 不能再放进快照，等新的关键帧后再服务订阅。FLV 时间戳变化不算参数变化。
+                        let changed = if self.format == PreviewFormat::Flv {
+                            match (
+                                flv::sequence_payload(&entry.1),
+                                flv::sequence_payload(&chunk),
+                            ) {
+                                (Some(previous), Some(next)) => previous != next,
+                                _ => entry.1 != chunk,
+                            }
+                        } else {
+                            entry.1 != chunk
+                        };
+                        if changed {
                             entry.1 = chunk.clone();
                             self.drop_history();
+                            if slot == flv::TAG_VIDEO || slot == flv::TAG_AUDIO {
+                                self.gop.clear();
+                                self.gop_bytes = 0;
+                                self.gop_ready = false;
+                            }
                         }
                     }
                     None => self.sequence_headers.push((slot, chunk.clone())),
+                }
+                if self.format == PreviewFormat::Flv {
+                    self.set_codecs(flv::codecs_from_sequence_headers(&self.sequence_headers));
                 }
                 self.broadcast(chunk);
             }
@@ -575,6 +883,12 @@ impl PreviewSink {
     fn drop_history(&mut self) {
         self.history.clear();
         self.history_bytes = 0;
+    }
+
+    fn set_codecs(&self, codecs: Option<String>) {
+        if let HubState::Available { codecs: slot, .. } = &mut *self.hub.state.write().unwrap() {
+            *slot = codecs;
+        }
     }
 
     fn retain(&mut self, chunk: Bytes) {
@@ -680,8 +994,134 @@ impl Drop for PreviewSink {
 pub mod ts {
     const PACKET: usize = 188;
 
+    fn payload(packet: &[u8]) -> Option<&[u8]> {
+        if packet.len() != PACKET || packet[0] != 0x47 {
+            return None;
+        }
+        let afc = (packet[3] >> 4) & 3;
+        if afc & 1 == 0 {
+            return None;
+        }
+        let start = if afc & 2 != 0 {
+            5 + usize::from(packet[4])
+        } else {
+            4
+        };
+        packet.get(start..)
+    }
+
+    /// PMT 中的视频编码类型。没有完整 PMT 时保持未知，避免将 HEVC 的 NAL 当成 AVC。
+    fn video_stream_type(chunk: &[u8]) -> Option<u8> {
+        for packet in chunk.chunks_exact(PACKET) {
+            if packet[1] & 0x40 == 0 {
+                continue;
+            }
+            let Some(data) = payload(packet) else {
+                continue;
+            };
+            let Some(&pointer) = data.first() else {
+                continue;
+            };
+            let Some(section) = data.get(1 + usize::from(pointer)..) else {
+                continue;
+            };
+            if section.first() != Some(&2) {
+                continue;
+            }
+            if section.len() < 12 {
+                continue;
+            }
+            let section_len = (usize::from(section[1] & 0x0f) << 8) | usize::from(section[2]);
+            let end = 3 + section_len;
+            if end > section.len() || end < 16 {
+                continue;
+            }
+            let info_len = (usize::from(section[10] & 0x0f) << 8) | usize::from(section[11]);
+            let mut offset = 12 + info_len;
+            while offset + 5 <= end - 4 {
+                let stream_type = section[offset];
+                if stream_type == 0x1b || stream_type == 0x24 {
+                    return Some(stream_type);
+                }
+                let es_len = (usize::from(section[offset + 3] & 0x0f) << 8)
+                    | usize::from(section[offset + 4]);
+                offset += 5 + es_len;
+            }
+        }
+        None
+    }
+
+    fn first_video_es(chunk: &[u8]) -> Option<Vec<u8>> {
+        let mut es = Vec::new();
+        let mut video_pid = None;
+        for packet in chunk.chunks_exact(PACKET) {
+            let Some(data) = payload(packet) else {
+                continue;
+            };
+            let pusi = packet[1] & 0x40 != 0;
+            let pid = (u16::from(packet[1] & 0x1f) << 8) | u16::from(packet[2]);
+            if video_pid.is_none()
+                && pusi
+                && data.starts_with(&[0, 0, 1])
+                && data.get(3).is_some_and(|id| (0xe0..=0xef).contains(id))
+            {
+                video_pid = Some(pid);
+                es.extend_from_slice(data.get(9 + usize::from(*data.get(8)?)..)?);
+            } else if video_pid == Some(pid) {
+                if pusi {
+                    break;
+                }
+                es.extend_from_slice(data);
+            }
+            if es.len() >= 64 * 1024 {
+                break;
+            }
+        }
+        video_pid.map(|_| es)
+    }
+
+    /// 在第一个视频 PES 的参数集中读取实际 profile / level，音轨参数交给播放器解复用器。
+    pub fn video_codec(chunk: &[u8]) -> Option<String> {
+        let stream_type = video_stream_type(chunk)?;
+        let es = first_video_es(chunk)?;
+        for i in 0..es.len().saturating_sub(4) {
+            if es.get(i..i + 3) != Some(&[0, 0, 1]) {
+                continue;
+            }
+            let nal = es.get(i + 3..)?;
+            if stream_type == 0x1b && nal.first().is_some_and(|b| b & 0x1f == 7) {
+                return Some(format!(
+                    "avc1.{:02x}{:02x}{:02x}",
+                    nal.get(1)?,
+                    nal.get(2)?,
+                    nal.get(3)?
+                ));
+            }
+            if stream_type == 0x24 && nal.first().is_some_and(|b| (b >> 1) & 0x3f == 33) {
+                let mut rbsp = Vec::new();
+                let mut zeroes = 0;
+                for &byte in nal.get(2..)? {
+                    if zeroes >= 2 && byte == 3 {
+                        zeroes = 0;
+                        continue;
+                    }
+                    rbsp.push(byte);
+                    zeroes = if byte == 0 { zeroes + 1 } else { 0 };
+                    if rbsp.len() == 13 {
+                        break;
+                    }
+                }
+                let mut config = vec![1];
+                config.extend_from_slice(rbsp.get(1..13)?);
+                return super::mp4::hevc_codec("hvc1", &config);
+            }
+        }
+        None
+    }
+
     /// `Some(true)` 从关键帧起，`Some(false)` 不是，`None` 说不准（调用方按关键帧处理）。
     pub fn segment_starts_with_idr(chunk: &[u8]) -> Option<bool> {
+        let hevc = video_stream_type(chunk) == Some(0x24);
         let mut es: Vec<u8> = Vec::new();
         let mut video_pid: Option<u16> = None;
         let mut offset = 0;
@@ -734,7 +1174,20 @@ pub mod ts {
         let mut i = 0;
         while i + 4 <= es.len() {
             if es[i] == 0 && es[i + 1] == 0 && es[i + 2] == 1 {
-                let nal_type = es[i + 3] & 0x1f;
+                let nal_type = if hevc {
+                    (es[i + 3] >> 1) & 0x3f
+                } else {
+                    es[i + 3] & 0x1f
+                };
+                if hevc {
+                    match nal_type {
+                        16..=21 | 32..=34 => return Some(true),
+                        0..=9 => verdict = Some(false),
+                        _ => {}
+                    }
+                    i += 3;
+                    continue;
+                }
                 match nal_type {
                     5 | 7 => return Some(true),
                     1 => verdict = Some(false),
@@ -763,6 +1216,66 @@ pub mod flv {
     pub const TAG_VIDEO: u8 = 9;
     pub const TAG_SCRIPT: u8 = 18;
 
+    /// 完整 FLV tag 中的载荷，排除时间戳和 PreviousTagSize。
+    pub(super) fn sequence_payload(tag: &[u8]) -> Option<&[u8]> {
+        let size = (usize::from(*tag.get(1)?) << 16)
+            | (usize::from(*tag.get(2)?) << 8)
+            | usize::from(*tag.get(3)?);
+        tag.get(11..11 + size)
+    }
+
+    pub(super) fn codecs_from_sequence_headers(headers: &[(u8, Bytes)]) -> Option<String> {
+        let codecs: Vec<_> = headers
+            .iter()
+            .filter_map(|(kind, chunk)| {
+                let body = sequence_payload(chunk)?;
+                match *kind {
+                    TAG_VIDEO => video_codec(body),
+                    TAG_AUDIO
+                        if body.first().is_some_and(|b| b >> 4 == 10)
+                            && body.get(1) == Some(&0) =>
+                    {
+                        super::mp4::audio_specific_codec(body.get(2..)?)
+                    }
+                    _ => None,
+                }
+            })
+            .collect();
+        (!codecs.is_empty()).then(|| codecs.join(","))
+    }
+
+    fn video_codec(body: &[u8]) -> Option<String> {
+        let first = *body.first()?;
+        let (fourcc, config) = if first & 0x80 != 0 {
+            if first & 0x0f != 0 {
+                return None;
+            }
+            (body.get(1..5)?, body.get(5..)?)
+        } else {
+            if body.get(1) != Some(&0) {
+                return None;
+            }
+            let fourcc: &[u8] = match first & 0x0f {
+                7 => b"avc1",
+                12 => b"hvc1",
+                13 => b"av01",
+                _ => return None,
+            };
+            (fourcc, body.get(5..)?)
+        };
+        match fourcc {
+            b"avc1" => Some(format!(
+                "avc1.{:02x}{:02x}{:02x}",
+                config.get(1)?,
+                config.get(2)?,
+                config.get(3)?
+            )),
+            b"hvc1" | b"hev1" => super::mp4::hevc_codec(std::str::from_utf8(fourcc).ok()?, config),
+            b"av01" => super::mp4::av1_codec(config),
+            _ => None,
+        }
+    }
+
     /// 由 tag 类型与载荷判定分块类型（不依赖任何解析器，几次字节比较）：
     /// script 与 AAC / AVC 序列头 → `SequenceHeader(tag 类型)`；视频关键帧 → `Keyframe`；其它 → `Media`。
     pub fn classify(tag_type: u8, body: &[u8]) -> ChunkKind {
@@ -790,8 +1303,8 @@ pub mod flv {
                     }
                 } else {
                     let codec = first & 0x0f;
-                    // AVC(7) / HEVC(12) 的第二字节 0 = 序列头
-                    if matches!(codec, 7 | 12) && body.get(1) == Some(&0) {
+                    // AVC(7) / HEVC(12) / AV1(13) 的第二字节 0 = 序列头
+                    if matches!(codec, 7 | 12 | 13) && body.get(1) == Some(&0) {
                         return ChunkKind::SequenceHeader(TAG_VIDEO);
                     }
                 }
@@ -1108,17 +1621,7 @@ pub mod mp4 {
             }
             b"av01" => {
                 let av1c = child(body.get(78..)?, b"av1C")?;
-                let b1 = *av1c.get(1)?;
-                let b2 = *av1c.get(2)?;
-                let profile = b1 >> 5;
-                let level = b1 & 0x1f;
-                let tier = if b2 & 0x80 != 0 { 'H' } else { 'M' };
-                let depth = match (b2 & 0x40 != 0, b2 & 0x20 != 0) {
-                    (true, true) => 12,
-                    (true, false) => 10,
-                    _ => 8,
-                };
-                Some(format!("av01.{profile}.{level:02}{tier}.{depth:02}"))
+                av1_codec(av1c)
             }
             b"vp09" => {
                 let vpcc = child(body.get(78..)?, b"vpcC")?;
@@ -1144,7 +1647,7 @@ pub mod mp4 {
     }
 
     /// ISO 14496-15 Annex E：`hvc1.<profile_space><profile_idc>.<compat flags 位序反转的十六进制>.<L|H><level_idc>.<constraint bytes 去尾零，点分>`
-    fn hevc_codec(fourcc: &str, hvcc: &[u8]) -> Option<String> {
+    pub(super) fn hevc_codec(fourcc: &str, hvcc: &[u8]) -> Option<String> {
         let b1 = *hvcc.get(1)?;
         let profile_space = match b1 >> 6 {
             0 => "",
@@ -1169,6 +1672,30 @@ pub mod mp4 {
             out.push_str(&format!(".{byte:X}"));
         }
         Some(out)
+    }
+
+    pub(super) fn av1_codec(config: &[u8]) -> Option<String> {
+        let b1 = *config.get(1)?;
+        let b2 = *config.get(2)?;
+        let profile = b1 >> 5;
+        let level = b1 & 0x1f;
+        let tier = if b2 & 0x80 != 0 { 'H' } else { 'M' };
+        let depth = match (b2 & 0x40 != 0, b2 & 0x20 != 0) {
+            (true, true) => 12,
+            (true, false) => 10,
+            _ => 8,
+        };
+        Some(format!("av01.{profile}.{level:02}{tier}.{depth:02}"))
+    }
+
+    pub(super) fn audio_specific_codec(config: &[u8]) -> Option<String> {
+        let first = *config.first()?;
+        let mut aot = (first >> 3) as u32;
+        if aot == 31 {
+            let second = *config.get(1)?;
+            aot = 32 + (((first & 0x07) as u32) << 3 | (second >> 5) as u32);
+        }
+        (aot != 0).then(|| format!("mp4a.40.{aot}"))
     }
 
     /// 读 MPEG-4 描述符的可变长度（每字节 7 位，高位为续标志，最多 4 字节）
@@ -1219,13 +1746,7 @@ pub mod mp4 {
         }
         // objectTypeIndication(1) streamType(1) bufferSizeDB(3) maxBitrate(4) avgBitrate(4) = 13
         let dsi = descriptor(dcd.get(13..)?, 0x05)?;
-        let first = *dsi.first()?;
-        let mut aot = (first >> 3) as u32;
-        if aot == 31 {
-            let second = *dsi.get(1)?;
-            aot = 32 + (((first & 0x07) as u32) << 3 | (second >> 5) as u32);
-        }
-        Some(format!("mp4a.40.{aot}"))
+        audio_specific_codec(dsi)
     }
 
     #[cfg(test)]
@@ -1624,6 +2145,59 @@ mod tests {
         assert_eq!(ts::segment_starts_with_idr(&[]), None);
     }
 
+    #[test]
+    fn ts_codec_probe_uses_pmt_to_distinguish_avc_and_hevc() {
+        fn packet(pid: u16, pusi: bool, payload: &[u8]) -> Vec<u8> {
+            let mut p = vec![
+                0x47,
+                ((pid >> 8) as u8 & 0x1f) | if pusi { 0x40 } else { 0 },
+                pid as u8,
+                0x10,
+            ];
+            p.extend_from_slice(payload);
+            p.resize(188, 0xff);
+            p
+        }
+        fn stream(stream_type: u8, nal: &[u8]) -> Vec<u8> {
+            let mut section = vec![
+                0x02,
+                0xb0,
+                0x12,
+                0,
+                1,
+                0xc1,
+                0,
+                0,
+                0xe1,
+                0,
+                0xf0,
+                0,
+                stream_type,
+                0xe1,
+                0,
+                0xf0,
+                0,
+                0,
+                0,
+                0,
+                0,
+            ];
+            let mut pmt = vec![0]; // PSI pointer field
+            pmt.append(&mut section);
+            let mut pes = vec![0, 0, 1, 0xe0, 0, 0, 0x80, 0x80, 5, 0x21, 0, 1, 0, 1];
+            pes.extend_from_slice(&[0, 0, 1]);
+            pes.extend_from_slice(nal);
+            [packet(0x100, true, &pmt), packet(0x101, true, &pes)].concat()
+        }
+
+        let avc = stream(0x1b, &[0x67, 0x64, 0, 0x28]);
+        assert_eq!(ts::video_codec(&avc).as_deref(), Some("avc1.640028"));
+
+        // SPS profile_tier_level: Main profile, level 144; the PMT identifies HEVC.
+        let hevc = stream(0x24, &[0x42, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x90]);
+        assert_eq!(ts::video_codec(&hevc).as_deref(), Some("hvc1.1.0.L144"));
+    }
+
     #[tokio::test]
     async fn fmp4_header_sets_codecs_and_is_broadcast_to_live_subscribers() {
         use mp4::build::*;
@@ -1733,7 +2307,9 @@ mod tests {
                 available: true,
                 format: None,
                 codecs: None,
-                reason: None
+                reason: None,
+                subscribers: 0,
+                max_subscribers: 4,
             }
         );
         assert!(!hub.is_attached());
@@ -1752,6 +2328,7 @@ mod tests {
         let status = unavailable.status();
         assert!(!status.available);
         assert_eq!(status.reason.as_deref(), Some("ffmpeg"));
+        assert_eq!(status.max_subscribers, 0);
         assert!(format!("{unavailable:?}").contains("Unavailable"));
     }
 
@@ -1769,6 +2346,71 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn decoder_snapshot_allows_only_browser_codec_limits_and_keeps_latest_gop() {
+        let hub = PreviewHub::new(1);
+        let mut sink = hub.attach(PreviewFormat::Flv);
+        sink.push(ChunkKind::Header, Bytes::from_static(&flv::FILE_HEADER));
+        sink.push(ChunkKind::SequenceHeader(9), Bytes::from_static(b"hevc"));
+        sink.push(ChunkKind::Keyframe, key(1));
+        sink.push(ChunkKind::Keyframe, key(2));
+        sink.mark_browser_unavailable("HEVC is unsupported by the browser player");
+        assert!(!hub.status().available);
+        assert!(matches!(
+            hub.subscribe(Duration::from_millis(50)).await,
+            Err(SubscribeError::Unavailable(_))
+        ));
+
+        let pending = tokio::spawn({
+            let hub = hub.clone();
+            async move { hub.subscribe_for_decoder(Duration::from_secs(2)).await }
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        sink.push(ChunkKind::Media, inter(3));
+        let subscription = pending.await.unwrap().unwrap();
+        assert_eq!(subscription.format, PreviewFormat::Flv);
+        assert_eq!(
+            subscription.snapshot,
+            vec![
+                Bytes::from_static(&flv::FILE_HEADER),
+                Bytes::from_static(b"hevc"),
+                key(2),
+                inter(3),
+            ]
+        );
+        assert_eq!(hub.subscribers(), 1);
+        assert!(matches!(
+            hub.subscribe_for_decoder(Duration::from_millis(50)).await,
+            Err(SubscribeError::TooManySubscribers(1))
+        ));
+        drop(subscription);
+        assert_eq!(hub.subscribers(), 0);
+        drop(sink);
+        assert!(matches!(
+            hub.subscribe_for_decoder(Duration::from_millis(50)).await,
+            Err(SubscribeError::NotAttached)
+        ));
+    }
+
+    #[tokio::test]
+    async fn decoder_snapshot_rejects_generically_unavailable_media_even_when_attached() {
+        let hub = PreviewHub::new(1);
+        let sink = hub.attach(PreviewFormat::MpegTs);
+        sink.mark_unavailable("missing fMP4 init segment");
+        assert!(hub.is_attached());
+        assert!(matches!(
+            hub.subscribe_for_decoder(Duration::from_millis(50)).await,
+            Err(SubscribeError::Unavailable(_))
+        ));
+        assert_eq!(hub.subscribers(), 0);
+        assert!(matches!(
+            PreviewHub::unavailable("ffmpeg directly writes to disk")
+                .subscribe_for_decoder(Duration::from_millis(50))
+                .await,
+            Err(SubscribeError::Unavailable(_))
+        ));
+    }
+
     /// 新订阅者拿到的快照 = 文件头 + 序列头 + 从最近关键帧起的整个 GOP，
     /// 实时接收端从快照之后的第一个分块开始，既不重复也不缺帧。
     #[tokio::test]
@@ -1782,7 +2424,7 @@ mod tests {
         sink.push(ChunkKind::Keyframe, key(1));
         sink.push(ChunkKind::Media, inter(2));
         sink.push(ChunkKind::Media, inter(3));
-        // 序列头更新后，快照里应是新的
+        // 序列头更新后等待新关键帧，快照不能包含旧编码参数的 GOP。
         sink.push(ChunkKind::SequenceHeader(9), Bytes::from_static(b"avc2"));
 
         let pending = tokio::spawn({
@@ -1791,6 +2433,7 @@ mod tests {
         });
         // 请求在写入端下一次推送时处理
         tokio::time::sleep(Duration::from_millis(20)).await;
+        sink.push(ChunkKind::Keyframe, key(7));
         sink.push(ChunkKind::Media, inter(4));
         let mut sub = pending.await.unwrap().expect("subscribed");
 
@@ -1800,13 +2443,11 @@ mod tests {
             Bytes::from_static(b"meta"),
             Bytes::from_static(b"aac"),
             Bytes::from_static(b"avc2"),
-            key(1),
-            inter(2),
-            inter(3),
-            inter(4),
+            key(7),
         ];
         assert_eq!(sub.snapshot, expected);
 
+        assert_eq!(sub.rx.recv().await.unwrap(), inter(4));
         sink.push(ChunkKind::Media, inter(5));
         sink.push(ChunkKind::Keyframe, key(6));
         assert_eq!(sub.rx.recv().await.unwrap(), inter(5));
@@ -2060,7 +2701,59 @@ mod tests {
             Bytes::from_static(b"avc-1080p"),
         );
         assert!(sink.history.is_empty(), "changed header drops history");
-        assert_eq!(sink.gop, vec![key(2)], "current GOP is kept as before");
+        assert!(
+            sink.gop.is_empty(),
+            "new configuration cannot reuse the old GOP"
+        );
+        assert!(
+            !sink.gop_ready,
+            "wait for a new keyframe after changing configuration"
+        );
+    }
+
+    #[test]
+    fn flv_codecs_come_from_avc_hevc_and_av1_headers_and_timestamp_only_repeats_keep_gops() {
+        let hub = PreviewHub::new(4);
+        let mut sink = hub.attach(PreviewFormat::Flv);
+        let video = |time, body: &[u8]| flv::tag_chunk(flv::TAG_VIDEO, time, body);
+        let avc = [0x17, 0, 0, 0, 0, 1, 0x64, 0, 0x28];
+        sink.push(ChunkKind::SequenceHeader(9), video(0, &avc));
+        sink.push(
+            ChunkKind::SequenceHeader(8),
+            flv::tag_chunk(8, 0, &[0xaf, 0, 0x12, 0x10]),
+        );
+        assert_eq!(
+            hub.status().codecs.as_deref(),
+            Some("avc1.640028,mp4a.40.2")
+        );
+        sink.push(ChunkKind::Keyframe, key(1));
+        sink.push(ChunkKind::Keyframe, key(2));
+        sink.push(ChunkKind::SequenceHeader(9), video(2000, &avc));
+        assert_eq!(sink.history.len(), 1);
+        assert!(sink.gop_ready);
+        let hvcc = [1, 1, 0x60, 0, 0, 0, 0xb0, 0, 0, 0, 0, 0, 0x90];
+        let hevc = [&[0x90, b'h', b'v', b'c', b'1'][..], &hvcc].concat();
+        sink.push(ChunkKind::SequenceHeader(9), video(3000, &hevc));
+        assert_eq!(
+            hub.status().codecs.as_deref(),
+            Some("hvc1.1.6.L144.B0,mp4a.40.2")
+        );
+        assert!(hub.status().available);
+        assert!(!sink.gop_ready);
+        let legacy_hevc = [&[0x1c, 0, 0, 0, 0][..], &hvcc].concat();
+        sink.push(ChunkKind::SequenceHeader(9), video(4000, &legacy_hevc));
+        assert_eq!(
+            hub.status().codecs.as_deref(),
+            Some("hvc1.1.6.L144.B0,mp4a.40.2")
+        );
+        sink.push(
+            ChunkKind::SequenceHeader(9),
+            video(5000, &[0x90, b'a', b'v', b'0', b'1', 0x81, 8, 0, 0]),
+        );
+        assert_eq!(
+            hub.status().codecs.as_deref(),
+            Some("av01.0.08M.08,mp4a.40.2")
+        );
     }
 
     /// 当前 GOP 超限作废时历史与之不再连续，一并放掉，等下一个关键帧从头攒。
@@ -2128,7 +2821,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(20)).await;
         sink.push(ChunkKind::Media, inter(2));
         let mut sub = pending.await.unwrap().unwrap();
-        assert_eq!(hub.0.subscribers.available_permits(), 0);
+        assert_eq!(hub.subscribers(), 1);
         // 名额已满，第二个订阅被拒
         assert_eq!(
             hub.subscribe(Duration::from_secs(1)).await.err(),
@@ -2147,7 +2840,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(20)).await;
         sink.push(ChunkKind::Keyframe, key(9));
         let mut again = pending.await.unwrap().unwrap();
-        assert_eq!(hub.0.subscribers.available_permits(), 0, "same permit");
+        assert_eq!(hub.subscribers(), 1, "same permit");
         assert_eq!(sink.receiver_count(), 1, "old receiver is gone");
         assert_eq!(
             again.snapshot,
@@ -2164,7 +2857,7 @@ mod tests {
         sink.push(ChunkKind::Media, inter(10));
         assert_eq!(again.rx.recv().await.unwrap(), inter(10));
         drop(again);
-        assert_eq!(hub.0.subscribers.available_permits(), 1);
+        assert_eq!(hub.subscribers(), 0);
     }
 
     /// 订阅者上限：超出的订阅立刻被拒，释放一个后又能进。
@@ -2194,6 +2887,120 @@ mod tests {
         sink.push(ChunkKind::Media, inter(3));
         assert!(c.await.unwrap().is_ok());
         drop(b);
+    }
+
+    /// 满员且允许挤：最早的那张票被挤掉（并得知是哪一级挤的），槽位数不变；
+    /// 被挤掉的连接晚些 drop 槽位时不会把新来的那条算掉。不许挤时照旧报当前占用数。
+    #[tokio::test]
+    async fn full_slots_evict_the_oldest_ticket_and_stay_fixed_size() {
+        let slots = PreviewSlots::new(SlotScope::Room, 2);
+        let (a, b, c) = (
+            PreviewTicket::new(),
+            PreviewTicket::new(),
+            PreviewTicket::new(),
+        );
+        let (slot_a, none) = slots.acquire(&a, true).unwrap();
+        assert!(none.is_none());
+        let (slot_b, _) = slots.acquire(&b, true).unwrap();
+        assert_eq!(slots.occupied(), 2);
+
+        assert_eq!(slots.acquire(&c, false).err(), Some(2));
+        assert_eq!(a.ended_by(), None, "a refusal evicts nobody");
+
+        let (slot_c, evicted) = slots.acquire(&c, true).unwrap();
+        assert_eq!(evicted.map(|e| e.id), Some(a.id()));
+        assert_eq!(a.ended_by(), Some(TicketEnd::Evicted(SlotScope::Room)));
+        assert_eq!(b.ended_by(), None);
+        assert_eq!(c.ended_by(), None);
+        assert_eq!(slots.occupied(), 2);
+        // 被挤掉的那条随时能得知（已经被挤掉，立刻完成）
+        let cause = tokio::time::timeout(Duration::from_secs(1), a.ended())
+            .await
+            .unwrap();
+        assert_eq!(cause, TicketEnd::Evicted(SlotScope::Room));
+        // 被挤掉的连接收尾时归还槽位：空操作
+        drop(slot_a);
+        assert_eq!(slots.occupied(), 2);
+        drop(slot_b);
+        assert_eq!(slots.occupied(), 1);
+        drop(slot_c);
+        assert_eq!(slots.occupied(), 0);
+    }
+
+    /// 一张票同时占直播间与进程两级：直播间一级挤掉它以后，它在进程一级的位置立刻不算数，
+    /// 新连接进进程池不必再挤掉另一个直播间的观众。
+    #[test]
+    fn a_ticket_evicted_by_one_pool_frees_its_place_in_the_other() {
+        let room = PreviewSlots::new(SlotScope::Room, 1);
+        let process = PreviewSlots::new(SlotScope::Process, 2);
+        let (old, other_room, new) = (
+            PreviewTicket::new(),
+            PreviewTicket::new(),
+            PreviewTicket::new(),
+        );
+        let _old_room = room.acquire(&old, true).unwrap();
+        let _old_process = process.acquire(&old, true).unwrap();
+        let _other = process.acquire(&other_room, true).unwrap();
+        assert_eq!(process.occupied(), 2);
+
+        let (_new_room, evicted) = room.acquire(&new, true).unwrap();
+        assert_eq!(evicted.map(|e| e.id), Some(old.id()));
+        assert_eq!(process.occupied(), 1, "the evicted ticket no longer counts");
+        let (_new_process, evicted) = process.acquire(&new, true).unwrap();
+        assert!(evicted.is_none());
+        assert_eq!(other_room.ended_by(), None);
+        assert_eq!(process.occupied(), 2);
+    }
+
+    /// hub 一级：`reserve(evict = true)` 在满员时挤掉最早的订阅，新订阅照常拿到快照；
+    /// 被挤掉的订阅 drop 后占用数不变，两条都 drop 后归零。`evict = false` 维持拒绝。
+    #[tokio::test]
+    async fn hub_reserve_evicts_the_oldest_subscription_when_full() {
+        let hub = PreviewHub::new(1);
+        let mut sink = hub.attach(PreviewFormat::Flv);
+        sink.push(ChunkKind::Keyframe, key(1));
+        let subscribe = |hub: PreviewHub, ticket: PreviewTicket| {
+            tokio::spawn(async move {
+                let (slot, evicted) = hub.reserve(&ticket, true)?;
+                let sub = hub
+                    .subscribe_reserved(slot, None, Duration::from_secs(5))
+                    .await?;
+                Ok::<_, SubscribeError>((sub, evicted))
+            })
+        };
+        let first_ticket = PreviewTicket::new();
+        let first = subscribe(hub.clone(), first_ticket.clone());
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        sink.push(ChunkKind::Media, inter(2));
+        let (first, evicted) = first.await.unwrap().unwrap();
+        assert!(evicted.is_none());
+        assert_eq!(hub.status().subscribers, 1);
+
+        assert_eq!(
+            hub.reserve(&PreviewTicket::new(), false).err(),
+            Some(SubscribeError::TooManySubscribers(1))
+        );
+
+        let second = subscribe(hub.clone(), PreviewTicket::new());
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        sink.push(ChunkKind::Media, inter(3));
+        let (second, evicted) = second.await.unwrap().unwrap();
+        assert_eq!(evicted.map(|e| e.id), Some(first_ticket.id()));
+        assert_eq!(
+            first_ticket.ended_by(),
+            Some(TicketEnd::Evicted(SlotScope::Room))
+        );
+        assert_eq!(hub.subscribers(), 1);
+        drop(first);
+        assert_eq!(hub.subscribers(), 1);
+        drop(second);
+        assert_eq!(hub.subscribers(), 0);
+
+        let unavailable = PreviewHub::unavailable("ffmpeg");
+        assert!(matches!(
+            unavailable.reserve(&PreviewTicket::new(), true),
+            Err(SubscribeError::Unavailable(_))
+        ));
     }
 
     /// 慢订阅者不拖慢写入端：一个从不读取的订阅者在场，写入端推 20 倍缓冲容量的分块也

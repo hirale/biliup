@@ -7,7 +7,7 @@ COPY . /biliup
 
 RUN set -eux; \
 	\
-	if [ ! -f /biliup/crates/stream-gears/pyproject.toml ]; then \
+	if [ ! -f /biliup/crates/biliup-cli/Cargo.toml ]; then \
 	rm -rf /biliup; \
 	git clone --depth 1 --branch "$branch_name" "$repo_url" /biliup; \
 	fi;
@@ -19,59 +19,44 @@ RUN set -eux; \
 	npm run build;
 
 
-# Build biliup's python wheel
-FROM rust:latest AS wheel-builder
-ARG repo_url=https://github.com/hirale/biliup
-ARG branch_name=master
-
-COPY . /biliup
-
-RUN set -eux; \
-	\
-	apt-get update; \
-	apt-get install -y --no-install-recommends python3-pip g++ patchelf; \
-	pip3 install maturin --break-system-packages; \
-	if [ ! -f /biliup/crates/stream-gears/pyproject.toml ]; then \
-	rm -rf /biliup; \
-	git clone --depth 1 --branch "$branch_name" "$repo_url" /biliup; \
-	fi;
-
-COPY --from=webui-builder /biliup/out /biliup/out
-
+# The service runs the native CLI; the Python distribution only provides APIs.
+FROM rust:latest AS binary-builder
+COPY --from=webui-builder /biliup /biliup
 WORKDIR /biliup
+# 随包字体不进仓库：镜像里按固定 SHA-256 取回，来源与 CI、发布包一致
+RUN set -eux; dir=crates/biliup-cli/assets/render-tools/fonts; mkdir -p "$dir"; curl -fsSL --retry 3 -o "$dir/NotoSansSC-Regular.otf" 'https://raw.githubusercontent.com/notofonts/noto-cjk/f8d157532fbfaeda587e826d4cd5b21a49186f7c/Sans/OTF/SimplifiedChinese/NotoSansCJKsc-Regular.otf'; echo "2c76254f6fc379fddfce0a7e84fb5385bb135d3e399294f6eeb6680d0365b74b  $dir/NotoSansSC-Regular.otf" | sha256sum -c -; curl -fsSL --retry 3 -o "$dir/NotoEmoji.ttf" 'https://raw.githubusercontent.com/google/fonts/47d54ca1ebb14fd864695f1d39dc734f39017c33/ofl/notoemoji/NotoEmoji%5Bwght%5D.ttf'; echo "de6c18832938afc99caf132b39d6a30a19bac7f2e812e28db2535b4608d27551  $dir/NotoEmoji.ttf" | sha256sum -c -
+RUN cargo build --locked --release -p biliup-cli --bin biliup
 
-RUN set -eux; \
-	maturin build --release -m crates/stream-gears/Cargo.toml;
-
-
-# Deploy Biliup
-FROM python:3.13-slim AS biliup
-
-ENV TZ="Asia/Shanghai"
-ENV LANG="C.UTF-8"
-ENV LANGUAGE="C.UTF-8"
-ENV LC_ALL="C.UTF-8"
+FROM python:3.13-slim-trixie AS biliup
+ENV TZ="Asia/Shanghai" LANG="C.UTF-8" LANGUAGE="C.UTF-8" LC_ALL="C.UTF-8"
+RUN pip3 install --no-cache-dir "yt-dlp>=2025.7.21" "streamlink>=7.5.0"
 EXPOSE 19159/tcp
 VOLUME /opt
-
-# 需要遵守 wheel 文件名规范
-COPY --from=wheel-builder /biliup/target/wheels/* /tmp/
-COPY --from=wheel-builder /biliup/scripts /opt/scripts
+COPY --from=binary-builder /biliup/target/release/biliup /usr/local/bin/biliup
+COPY --from=binary-builder /biliup/crates/biliup-cli/assets/render-tools /usr/local/bin/render-tools
+COPY --from=binary-builder /biliup/scripts /opt/scripts
 # /opt is usually bind-mounted, which hides /opt/scripts; this copy stays reachable.
-COPY --from=wheel-builder /biliup/scripts /usr/local/share/biliup/scripts
-
+COPY --from=binary-builder /biliup/scripts /usr/local/share/biliup/scripts
 RUN set -eux; \
-	\
-	whl=$(ls /tmp/biliup*.whl); \
-	pip3 install --no-cache-dir "$whl"; \
-	pip3 cache purge; \
-	rm -rf /tmp/*;
+	packages="ca-certificates libssl3t64 libva-drm2"; \
+	if [ "$(dpkg --print-architecture)" = "amd64" ]; then \
+		# 完整 iHD 驱动提供 Intel VAAPI 编码；Debian 仅在 x86 平台提供此包。
+		sed -i 's/Components: main$/Components: main non-free/' /etc/apt/sources.list.d/debian.sources; \
+		packages="$packages intel-media-va-driver-non-free"; \
+	fi; \
+	apt-get update; \
+	apt-get install -y --no-install-recommends $packages; \
+	rm -rf /var/lib/apt/lists/*
 
 RUN set -eux; \
 	\
 	savedAptMark="$(apt-mark showmanual)"; \
 	useApt=false; \
+	arch="$(dpkg --print-architecture)"; arch="${arch##*-}"; \
 	apt-get update; \
+	if [ "$arch" = "amd64" ]; then \
+		apt-get install -y --no-install-recommends intel-gpu-tools; \
+	fi; \
 	apt-get install -y --no-install-recommends \
 		bash \
 		wget \
@@ -80,12 +65,16 @@ RUN set -eux; \
 	; \
 	apt-mark auto '.*' > /dev/null; \
 	apt-mark manual bash curl wget; \
+	if [ "$arch" = "amd64" ]; then \
+		apt-mark manual intel-gpu-tools; \
+	fi; \
 	\
-	arch="$(dpkg --print-architecture)"; arch="${arch##*-}"; \
 	# 固定 FFmpeg 到确定版本并校验 SHA-256：
 	# latest 是滚动 tag，资产每日重建，既不可复现也无法防篡改。
 	# 只能固定到「每月最后一天」的 autobuild：BtbN 长期保留月末构建，
 	# 其余每日构建约两周后删除，固定到它们会让镜像构建 404。
+	# Windows 桌面版打包同一构建的 win64 版：.github/scripts/ffmpeg-version.sh 从下面这行读取
+	# tag 与版本号；改版本时同步更新 desktop-publish.yml 里的 FFMPEG_WIN64_SHA256。
 	url='https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-08-31-13-27/ffmpeg-n8.1.2-50-g1a748fe2cd-'; \
 	case "$arch" in \
 		'amd64') \
@@ -143,7 +132,6 @@ RUN set -eux; \
 	apt-get purge -y --auto-remove -o APT::AutoRemove::RecommendsImportant=false; \
 	rm -rf \
 		/tmp/* \
-		/usr/share/doc/* \
 		/var/cache/* \
 		/var/lib/apt/lists/* \
 		/var/tmp/* \

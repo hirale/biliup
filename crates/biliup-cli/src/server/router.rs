@@ -1,6 +1,21 @@
+use crate::server::api::auto_clip::{
+    auto_clip_status, cancel_session_auto_clip, get_session_auto_clip, list_auto_clip_jobs,
+    start_session_auto_clip, test_auto_clip,
+};
 use crate::server::api::bilibili_endpoints::{
     archive_pre_endpoint, get_user_archives_endpoint, get_user_profile_endpoint,
 };
+use crate::server::api::clip_publish::{
+    cover_route, get_session_thumb, list_publish_jobs, preview_publish, publish_batch,
+    publish_clip, remove_publish, resume_publish, retry_publish,
+};
+use crate::server::api::clip_suggestions::{
+    accept_suggestion, dismiss_suggestion, list_suggestions,
+};
+use crate::server::api::clips::{
+    create_clip, delete_clip, download_clip, export_clip, get_clip, list_clips, update_clip,
+};
+use crate::server::api::danmaku_density::get_danmaku_density;
 use crate::server::api::endpoints::{
     add_upload_streamer_endpoint, add_user_endpoint, delete_streamers_endpoint,
     delete_template_endpoint, delete_user_endpoint, get_configuration, get_qrcode, get_status,
@@ -11,16 +26,28 @@ use crate::server::api::endpoints::{
 };
 use crate::server::api::live_media::{get_live_avatar, get_live_cover};
 use crate::server::api::live_preview::{
-    get_live_danmaku, get_live_danmaku_multi, get_live_stream, get_live_url,
+    get_live_danmaku, get_live_danmaku_multi, get_live_stream, get_live_url, release_live_stream,
 };
 use crate::server::api::live_rates::{get_live_rates, ws_live_rates};
+use crate::server::api::markers::{create_marker, delete_marker, list_markers, update_marker};
+use crate::server::api::renders::{
+    cancel_render, create_render, delete_render_asset, download_render, get_render,
+    get_render_asset, get_render_font, get_render_recipe, list_all_renders, list_renders,
+    preview_render, put_render_recipe, render_assets_route, render_gpus, render_tools,
+    retry_render,
+};
+use crate::server::api::session_retention::patch_session;
+use crate::server::api::sessions::{
+    delete_session, get_session, get_session_keyframes, get_session_media, list_sessions,
+};
+use crate::server::api::system_stats::get_system_stats;
 use crate::server::infrastructure::service_register::ServiceRegister;
 use axum::Router;
 use axum::body::Body;
 use axum::http::Request;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::routing::{delete, get, post, put};
+use axum::routing::{delete, get, patch, post, put};
 use tower::ServiceExt;
 use tower_http::services::ServeFile;
 
@@ -29,7 +56,48 @@ pub(crate) const ALLOWED_LOG_FILES: &[&str] = &["ds_update.log", "download.log",
 /// 创建应用程序路由
 pub fn router(service_register: ServiceRegister) -> Router<()> {
     Router::new()
+        .route(
+            "/v1/activity-events",
+            get(crate::server::api::activity_events::list),
+        )
+        .route(
+            "/v1/files/location",
+            get(crate::server::api::files::location),
+        )
+        .route("/v1/files/reveal", post(crate::server::api::files::reveal))
+        .route(
+            "/v1/upload-queue",
+            get(crate::server::api::upload_queue::list),
+        )
+        .route(
+            "/v1/upload-queue/{id}",
+            get(crate::server::api::upload_queue::detail),
+        )
+        .route(
+            "/v1/session-merge-candidates",
+            get(crate::server::api::session_groups::list_candidates),
+        )
+        .route(
+            "/v1/session-merge-candidates/{id}/confirm",
+            post(crate::server::api::session_groups::confirm_candidate),
+        )
+        .route(
+            "/v1/session-merge-candidates/{id}/dismiss",
+            post(crate::server::api::session_groups::dismiss_candidate),
+        )
+        .route(
+            "/v1/session-groups",
+            post(crate::server::api::session_groups::create_group),
+        )
         // 主播管理相关路由
+        .route(
+            "/v1/streamers/page",
+            get(crate::server::api::streamer_listing::page),
+        )
+        .route(
+            "/v1/overview",
+            get(crate::server::api::streamer_listing::overview),
+        )
         .route(
             "/v1/streamers",
             get(get_streamers_endpoint) // 获取主播列表
@@ -41,8 +109,18 @@ pub fn router(service_register: ServiceRegister) -> Router<()> {
         // 正在录制的直播间封面 / 主播头像（服务端带 Referer 转发，避开图片 CDN 防盗链）
         .route("/v1/streamers/{id}/cover", get(get_live_cover))
         .route("/v1/streamers/{id}/avatar", get(get_live_avatar))
+        .route(
+            "/v1/streamers/{id}/mosaic-frame",
+            get(crate::server::api::mosaic_frame::get_mosaic_frame),
+        )
         // 直播预览：复用正在录制的那一路流（chunked FLV / MPEG-TS），同样在登录校验之内
-        .route("/v1/streamers/{id}/live", get(get_live_stream))
+        // DELETE / POST（sendBeacon）：播放器销毁时立即释放这条预览，见 live_preview::lease
+        .route(
+            "/v1/streamers/{id}/live",
+            get(get_live_stream)
+                .delete(release_live_stream)
+                .post(release_live_stream),
+        )
         // 浏览器直连模式：当前录制中那条流的 CDN 直链
         .route("/v1/streamers/{id}/live-url", get(get_live_url))
         // 预览播放器的实时弹幕（SSE），同样在登录校验之内；监视器多路复用一条
@@ -52,10 +130,215 @@ pub fn router(service_register: ServiceRegister) -> Router<()> {
         // 不要为此调快 /v1/streamers
         .route("/v1/ws/live-rates", get(ws_live_rates))
         .route("/v1/live-rates", get(get_live_rates))
+        // 切片工作台：场次、可落刀位置、DVR 回看（只按场次 id 寻址，不接受路径）
+        .route("/v1/sessions", get(list_sessions))
+        .route(
+            "/v1/editor/projects",
+            get(crate::server::api::editor::list).post(crate::server::api::editor::create),
+        )
+        .route(
+            "/v1/editor/projects/{id}",
+            get(crate::server::api::editor::get)
+                .put(crate::server::api::editor::update)
+                .delete(crate::server::api::editor::delete),
+        )
+        .route(
+            "/v1/editor/projects/{id}/revisions/{revision}",
+            get(crate::server::api::editor::revision),
+        )
+        .route(
+            "/v1/editor/projects/{id}/revisions",
+            get(crate::server::api::editor::revisions),
+        )
+        .route("/v1/editor/projects/{id}/history",get(crate::server::api::editor::history).post(crate::server::api::editor::history_step))
+        .route(
+            "/v1/outputs",
+            get(crate::server::api::outputs::list),
+        )
+        .route("/v1/outputs/processing",get(crate::server::api::outputs::processing))
+        .route("/v1/outputs/{kind}/{id}/publish/preview",post(crate::server::api::outputs::publish_preview))
+        .route("/v1/outputs/{kind}/{id}/publish",post(crate::server::api::outputs::publish))
+        .route("/v1/outputs/{kind}/{id}/publish/covers",post(crate::server::api::outputs::cover_frame).put(crate::server::api::outputs::cover_upload).layer(axum::extract::DefaultBodyLimit::max(crate::server::workbench::output_publish::covers::MAX_INPUT_BYTES)))
+        .route("/v1/outputs/{kind}/{id}/publish/covers/{cover}",get(crate::server::api::outputs::cover_image))
+        .route(
+            "/v1/editor/projects/{id}/exports",
+            get(crate::server::api::editor::exports)
+                .post(crate::server::api::editor::export_create),
+        )
+        .route("/v1/editor/projects/{id}/analysis",get(crate::server::api::editor::analysis_jobs).post(crate::server::api::editor::analysis_start))
+        .route("/v1/editor/setup",get(crate::server::api::editor::setup_checks))
+        .route("/v1/editor/projects/{id}/resources/{kind}",get(crate::server::api::editor::resource_list).put(crate::server::api::editor::resource_save).delete(crate::server::api::editor::resource_delete))
+        .route("/v1/editor/projects/{id}/library/folders",get(crate::server::api::editor::sound_folders).put(crate::server::api::editor::save_sound_folder))
+        .route("/v1/editor/keys",get(crate::server::api::editor::provider_keys))
+        .route("/v1/editor/generators",get(crate::server::api::editor::generators))
+        .route("/v1/editor/projects/{id}/graphics",post(crate::server::api::editor::graphic_write))
+        .route("/v1/editor/projects/{id}/graphics/{name}",get(crate::server::api::editor::graphic_read))
+        .route("/v1/editor/projects/{id}/graphic-media/{media}",get(crate::server::api::editor::graphic_media))
+        .route("/v1/editor/projects/{id}/proxies",get(crate::server::api::editor::proxies).post(crate::server::api::editor::proxies_sync))
+        .route("/v1/editor/projects/{id}/recent",get(crate::server::api::editor::recent_media))
+        .route("/v1/editor/projects/{id}/agent",get(crate::server::api::editor::agent::state).post(crate::server::api::editor::agent::send))
+        .route("/v1/editor/projects/{id}/agent/cancel",post(crate::server::api::editor::agent::cancel))
+        .route("/v1/editor/projects/{id}/agent/approve",post(crate::server::api::editor::agent::approve))
+        .route("/v1/editor/projects/{id}/agent/screen-take",post(crate::server::api::editor::agent::screen_take))
+        .route("/v1/editor/projects/{id}/agent/thread",post(crate::server::api::editor::agent::new_thread))
+        .route("/v1/editor/projects/{id}/agent/plan",get(crate::server::api::editor::agent::plan_get).put(crate::server::api::editor::agent::plan_save))
+        .route("/v1/editor/projects/{id}/agent/images/{image}",get(crate::server::api::editor::agent::image))
+        .route("/v1/editor/projects/{id}/shaders",get(crate::server::api::editor::shaders))
+        .route("/v1/editor/projects/{id}/agent/files/{file}",get(crate::server::api::editor::agent::file))
+        .route("/v1/editor/projects/{id}/agent/turns/{turn}/undo",post(crate::server::api::editor::agent::undo))
+        .route("/v1/editor/projects/{id}/recent/{media}/import",post(crate::server::api::editor::recent_import))
+        .route("/v1/editor/projects/{id}/recent/{media}/thumb",get(crate::server::api::editor::recent_thumb))
+        .route("/v1/editor/projects/{id}/proxies/{media}/cancel",post(crate::server::api::editor::proxy_cancel))
+        .route("/v1/editor/projects/{id}/proxies/{media}/retry",post(crate::server::api::editor::proxy_retry))
+        .route("/v1/editor/model",get(crate::server::api::editor::model_settings).put(crate::server::api::editor::save_model_settings))
+        .route("/v1/editor/projects/{id}/generation",get(crate::server::api::editor::generation_jobs).post(crate::server::api::editor::generation_start))
+        .route("/v1/editor/projects/{id}/generation/{job}",get(crate::server::api::editor::generation_result).delete(crate::server::api::editor::generation_cancel))
+        .route("/v1/editor/library/state",get(crate::server::api::editor::online_library_state))
+        .route("/v1/editor/library/search",post(crate::server::api::editor::online_library_search))
+        .route("/v1/editor/library/preview/{source}/{sound}",get(crate::server::api::editor::online_library_preview))
+        .route("/v1/editor/projects/{id}/library/online/{source}/{sound}",post(crate::server::api::editor::online_library_add))
+        .route("/v1/editor/projects/{id}/library/items/{item}",post(crate::server::api::editor::library_add))
+        .route("/v1/editor/keys/{provider}",axum::routing::put(crate::server::api::editor::save_provider_key).delete(crate::server::api::editor::remove_provider_key))
+        .route("/v1/editor/projects/{id}/library/folders/{folder}",axum::routing::delete(crate::server::api::editor::delete_sound_folder))
+        .route("/v1/editor/projects/{id}/library/sounds/{sound}/{kind}",get(crate::server::api::editor::library_sound))
+        .route("/v1/editor/projects/{id}/brand/files",get(crate::server::api::editor::brand_files))
+        .route("/v1/editor/projects/{id}/brand",get(crate::server::api::editor::brand_state))
+        .route("/v1/editor/projects/{id}/render-assets",get(crate::server::api::editor::render_assets))
+        .route("/v1/editor/projects/{id}/fonts",get(crate::server::api::editor::project_fonts).post(crate::server::api::editor::project_font_upload).layer(axum::extract::DefaultBodyLimit::max(crate::server::workbench::editor::project_fonts::MAX_BYTES)))
+        .route("/v1/editor/projects/{id}/brand/{scope}/{kit}/files",post(crate::server::api::editor::brand_upload).layer(axum::extract::DefaultBodyLimit::max(200*1024*1024)))
+        .route("/v1/editor/projects/{id}/brand/{scope}/{kit}/import",post(crate::server::api::editor::brand_import))
+        .route("/v1/editor/projects/{id}/brand/{scope}/{kit}/files/{name}",get(crate::server::api::editor::brand_file))
+        .route("/v1/editor/transcription",get(crate::server::api::editor::transcription_state))
+        .route("/v1/editor/transcription/download",post(crate::server::api::editor::transcription_download))
+        .route("/v1/editor/transcription/cancel",post(crate::server::api::editor::transcription_cancel))
+        .route("/v1/editor/transcription/select",post(crate::server::api::editor::transcription_select))
+        .route("/v1/editor/projects/{id}/analysis/{job}/cancel",post(crate::server::api::editor::analysis_cancel))
+        .route("/v1/editor/projects/{id}/analysis/media/{media}",get(crate::server::api::editor::analysis_cached))
+        .route("/v1/editor/projects/{id}/exports/loudness",post(crate::server::api::editor::export_loudness))
+        .route(
+            "/v1/editor/projects/{id}/exports/{job}/cancel",
+            post(crate::server::api::editor::export_cancel),
+        )
+        .route(
+            "/v1/editor/projects/{id}/exports/{job}/retry",
+            post(crate::server::api::editor::export_retry),
+        )
+        .route(
+            "/v1/editor/projects/{id}/exports/{job}/download",
+            get(crate::server::api::editor::export_download),
+        )
+        .route(
+            "/v1/editor/projects/{id}/media/{media}/{kind}",
+            get(crate::server::api::editor::media),
+        )
+        .route(
+            "/v1/editor/projects/{id}/imports",
+            post(crate::server::api::editor::import_media).layer(axum::extract::DefaultBodyLimit::disable()),
+        )
+        .route(
+            "/v1/editor/sessions/{id}/media/{media}/{kind}",
+            get(crate::server::api::editor::session_media),
+        )
+        // PATCH 是「保留这场」：改场次的 retain_until；DELETE 清除已结束场次的历史记录。
+        .route(
+            "/v1/sessions/{id}",
+            get(get_session).patch(patch_session).delete(delete_session),
+        )
+        .route("/v1/sessions/{id}/keyframes", get(get_session_keyframes))
+        .route("/v1/sessions/{id}/media", get(get_session_media))
+        // 切片工作台：看直播时打的标记（只按场次 id、标记 id 寻址）
+        .route(
+            "/v1/sessions/{id}/markers",
+            get(list_markers).post(create_marker),
+        )
+        .route(
+            "/v1/sessions/{id}/markers/{mid}",
+            patch(update_marker).delete(delete_marker),
+        )
+        // 控制台首页的系统状态（CPU / 内存 / 录制目录磁盘 / 网速）；`?since=` 只取增量
+        .route("/v1/system-stats", get(get_system_stats))
+        // 切片工作台：切片与导出（只按场次 id、切片 id 寻址）
+        .route("/v1/sessions/{id}/clips", get(list_clips).post(create_clip))
+        .route(
+            "/v1/sessions/{id}/clips/{cid}",
+            patch(update_clip).delete(delete_clip),
+        )
+        .route("/v1/clips/{cid}", get(get_clip))
+        .route("/v1/clips/{cid}/export", post(export_clip))
+        .route("/v1/clips/{cid}/download", get(download_clip))
+        // 录后编辑与合成：保存场次配置、按 ID 上传图片、创建不可变合成任务。
+        .route(
+            "/v1/sessions/{id}/render-recipe",
+            get(get_render_recipe).put(put_render_recipe),
+        )
+        .route(
+            "/v1/sessions/{id}/render-settings",
+            get(get_render_recipe).put(put_render_recipe),
+        )
+        .route("/v1/sessions/{id}/render-assets", render_assets_route())
+        .route(
+            "/v1/render-assets/{aid}",
+            get(get_render_asset).delete(delete_render_asset),
+        )
+        .route(
+            "/v1/sessions/{id}/renders",
+            get(list_renders).post(create_render),
+        )
+        .route("/v1/renders", get(list_all_renders))
+        .route("/v1/render-gpus", get(render_gpus))
+        .route("/v1/renders/{jid}", get(get_render).delete(cancel_render))
+        .route("/v1/renders/{jid}/cancel", post(cancel_render))
+        .route("/v1/renders/{jid}/retry", post(retry_render))
+        .route("/v1/renders/{jid}/download", get(download_render))
+        .route("/v1/sessions/{id}/render-preview", post(preview_render))
+        .route("/v1/render-tools", get(render_tools))
+        .route("/v1/render-capabilities", get(render_tools))
+        .route("/v1/render-fonts/{id}", get(get_render_font))
+        // 切片工作台：发布（导出 → 上传 → 投稿；一律转载，来源默认直播间地址）
+        .route("/v1/clips/{cid}/publish", post(publish_clip))
+        .route("/v1/clips/{cid}/cover", cover_route())
+        .route("/v1/sessions/{id}/thumb", get(get_session_thumb))
+        .route(
+            "/v1/publish-jobs",
+            get(list_publish_jobs).post(publish_batch),
+        )
+        .route("/v1/publish-jobs/preview", post(preview_publish))
+        .route("/v1/publish-jobs/resume", post(resume_publish))
+        .route("/v1/publish-jobs/{jid}/retry", post(retry_publish))
+        .route("/v1/publish-jobs/{jid}", delete(remove_publish))
         // 配置管理路由
         .route(
             "/v1/configuration",
-            get(get_configuration).put(put_configuration), // 获取/更新配置
+            get(get_configuration)
+                .put(put_configuration)
+                .layer(axum::middleware::from_fn(no_store)), // 含账号凭据，禁止 HTTP 缓存
+        )
+        // 自动切片（实验）：模型接口连通性测试与状态
+        .route("/v1/auto-clip/test", post(test_auto_clip))
+        .route("/v1/auto-clip/status", get(auto_clip_status))
+        // 多场各自最近的任务（剪辑台一页一次请求）
+        .route("/v1/auto-clip/jobs", get(list_auto_clip_jobs))
+        // 按场次生成候选：GET 看任务与用量预估，POST 先预估、确认后入队，DELETE 取消
+        .route(
+            "/v1/sessions/{id}/auto-clip",
+            get(get_session_auto_clip)
+                .post(start_session_auto_clip)
+                .delete(cancel_session_auto_clip),
+        )
+        // 候选：列表、接受（建切片草稿）、丢弃
+        .route("/v1/sessions/{id}/suggestions", get(list_suggestions))
+        .route(
+            "/v1/sessions/{id}/suggestions/{sid}/accept",
+            post(accept_suggestion),
+        )
+        .route(
+            "/v1/sessions/{id}/suggestions/{sid}/dismiss",
+            post(dismiss_suggestion),
+        )
+        // 弹幕密度曲线：10 秒一桶、基线与高峰
+        .route(
+            "/v1/sessions/{id}/danmaku-density",
+            get(get_danmaku_density),
         )
         // 主播信息路由
         .route("/v1/streamer-info", get(get_streamer_info)) // 获取主播信息
@@ -86,7 +369,18 @@ pub fn router(service_register: ServiceRegister) -> Router<()> {
         .route("/v1/tools", get(get_tools)) // ffmpeg 是否可用、版本与许可
         .route("/v1/uploads", post(post_uploads))
         .route("/static/{path}", get(using_serve_file_from_a_route))
+        // 斗鱼Cookie验证
+        .merge(crate::server::api::douyu_validation::router())
         .with_state(service_register) // 注入服务注册器状态
+}
+
+async fn no_store(request: axum::extract::Request, next: axum::middleware::Next) -> Response {
+    let mut response = next.run(request).await;
+    response.headers_mut().insert(
+        axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-store"),
+    );
+    response
 }
 
 async fn using_serve_file_from_a_route(
@@ -198,11 +492,11 @@ mod tests {
 
         assert_eq!(
             resolve_static_path(root.path(), "recording.mp4").unwrap(),
-            video
+            video.canonicalize().unwrap()
         );
         assert_eq!(
             resolve_static_path(root.path(), "ds_update.log").unwrap(),
-            log
+            log.canonicalize().unwrap()
         );
         assert_eq!(
             resolve_static_path(root.path(), "cookies.json"),

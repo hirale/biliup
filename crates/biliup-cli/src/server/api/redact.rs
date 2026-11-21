@@ -3,13 +3,16 @@
 //! 配置按字段**白名单**输出：不在名单里的键一律置 `null`，所以新增的配置字段默认不外露，
 //! 要让操作员 / 只读用户看到必须显式加进来。
 
+use crate::server::config::Config;
 use serde_json::Value;
 
 /// 非超管可见的全局配置字段：都是录制与投稿参数，不含凭据、路径形式的凭据或钩子。
-const VISIBLE_CONFIG_KEYS: &[&str] = &[
+/// Fleet 也只下发这些字段（D11），名单外的键只留在各节点本地。
+pub const VISIBLE_CONFIG_KEYS: &[&str] = &[
     "downloader",
     "sync_save_dir",
     "ffmpeg_path",
+    "render_fonts_dir",
     "file_size",
     "segment_time",
     "filtering_threshold",
@@ -19,17 +22,23 @@ const VISIBLE_CONFIG_KEYS: &[&str] = &[
     "submit_api",
     "lines",
     "threads",
+    "max_upload_limit",
     "delay",
     "event_loop_interval",
     "checker_sleep",
     "pool1_size",
     "pool2_size",
+    "live_merge_minutes",
+    "retention_hours",
+    "min_free_space",
     "preview_transport",
+    "preview_max_minutes",
     "use_live_cover",
     "douyu_cdn",
     "douyu_force_hs",
     "douyu_danmaku",
     "douyu_rate",
+    "douyu_codec",
     "douyu_disable_interactive_game",
     "huya_cdn",
     "huya_cdn_fallback",
@@ -83,7 +92,16 @@ pub const STREAMER_HOOK_KEYS: &[&str] = &[
     "segment_processor",
     "downloaded_processor",
     "postprocessor",
+    "opt_args",
 ];
+
+/// 自动切片的 API key 对所有人都只给掩码（包括有 `config.edit` 的人），保存时收到掩码保留原值，
+/// 见 [`crate::server::auto_clip::settings`]。所有返回配置的接口在输出前都要调它。
+pub fn mask_api_keys(config: &mut Config) {
+    if let Some(auto_clip) = &mut config.auto_clip {
+        *auto_clip = auto_clip.masked();
+    }
+}
 
 pub fn config(config: &impl serde::Serialize) -> Value {
     let mut value = serde_json::to_value(config).unwrap_or(Value::Null);
@@ -108,10 +126,12 @@ pub fn streamer_hooks(streamer: &mut Value) {
 }
 
 pub fn upload_template(template: &mut Value) {
-    if let Value::Object(map) = template
-        && let Some(field) = map.get_mut("user_cookie")
-    {
-        *field = Value::Null;
+    if let Value::Object(map) = template {
+        for key in ["user_cookie", "cover_path"] {
+            if let Some(field) = map.get_mut(key) {
+                *field = Value::Null;
+            }
+        }
     }
 }
 
@@ -121,11 +141,25 @@ mod tests {
     use crate::server::config::{Config, UserConfig};
 
     #[test]
+    fn upload_template_hides_credentials_and_local_paths() {
+        let mut template = serde_json::json!({
+            "user_cookie": "/data/secret.json",
+            "cover_path": "/srv/private-cover.jpg",
+            "template_name": "public"
+        });
+        upload_template(&mut template);
+        assert_eq!(template["user_cookie"], Value::Null);
+        assert_eq!(template["cover_path"], Value::Null);
+        assert_eq!(template["template_name"], "public");
+    }
+
+    #[test]
     fn secrets_are_hidden_and_ordinary_settings_are_kept() {
         let config = Config {
             kuaishou_cookie: Some("ks-secret".into()),
             twitcasting_password: Some("tc-secret".into()),
             preview_transport: Some(crate::server::config::PreviewTransport::Direct),
+            max_upload_limit: Some(3),
             user: Some(UserConfig {
                 bili_cookie: Some("SESSDATA=secret".into()),
                 douyin_cookie: Some("dy-secret".into()),
@@ -149,6 +183,7 @@ mod tests {
         assert_eq!(redacted["streamers"], Value::Null);
         assert_eq!(redacted["preview_transport"], "direct");
         assert_eq!(redacted["pool1_size"], 5);
+        assert_eq!(redacted["max_upload_limit"], 3);
         // 键本身保留，前端按同一套字段渲染
         assert!(
             redacted
@@ -156,6 +191,32 @@ mod tests {
                 .unwrap()
                 .contains_key("kuaishou_cookie")
         );
+    }
+
+    #[test]
+    fn auto_clip_keys_are_masked_and_hidden_from_non_admins() {
+        use crate::server::auto_clip::settings::AutoClipConfig;
+        let secret = "sk-secret-0123456789";
+        let mut config = Config {
+            auto_clip: Some(
+                AutoClipConfig::builder()
+                    .base_url("https://api.example.com/v1".into())
+                    .api_key(secret.into())
+                    .build(),
+            ),
+            ..Config::default()
+        };
+        mask_api_keys(&mut config);
+        let full = serde_json::to_string(&config).unwrap();
+        assert!(
+            !full.contains(secret) && full.contains("sk-…6789"),
+            "{full}"
+        );
+        assert_eq!(super::config(&config)["auto_clip"], Value::Null);
+
+        let mut untouched = Config::default();
+        mask_api_keys(&mut untouched);
+        assert_eq!(untouched, Config::default());
     }
 
     #[test]
@@ -175,10 +236,12 @@ mod tests {
             "remark": "a",
             "override": {"downloader": "ffmpeg"},
             "postprocessor": [{"run": "rclone copy"}],
+            "opt_args": ["-ss", "00:00:16"],
         });
         streamer_hooks(&mut streamer);
         assert_eq!(streamer["override"], Value::Null);
         assert_eq!(streamer["postprocessor"], Value::Null);
+        assert_eq!(streamer["opt_args"], Value::Null);
         assert_eq!(streamer["remark"], "a");
     }
 }

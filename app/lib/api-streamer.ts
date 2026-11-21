@@ -4,6 +4,10 @@ import { mutate } from 'swr';
 
 export const API_BASE = process.env.NEXT_PUBLIC_API_SERVER ?? '';
 
+/** 共享的 API 请求，开发时跨源访问后端也携带并接收登录会话 Cookie。 */
+export const apiFetch = (input: RequestInfo | URL, init?: RequestInit) =>
+	fetch(API_BASE + input, { credentials: 'include', ...init });
+
 /** 当前用户与权限点（见 use-me.ts）。放在这里是为了让统一的响应处理能刷新它，又不形成循环引用。 */
 export const ME_KEY = '/v1/me';
 
@@ -15,7 +19,7 @@ export function revalidateMe() {
 	mutate(ME_KEY).catch(() => undefined);
 }
 export async function sendRequest<T>(url: string, { arg }: { arg: T }) {
-	const res = await fetch(API_BASE + url, {
+	const res = await apiFetch(url, {
 		method: 'POST',
 		headers: { 'Content-Type': 'application/json' },
 		body: JSON.stringify(arg),
@@ -25,25 +29,25 @@ export async function sendRequest<T>(url: string, { arg }: { arg: T }) {
 }
 
 export const fetcher = async (input: RequestInfo | URL, init?: RequestInit) => {
-	const res = await fetch(API_BASE + input, init);
+	const res = await apiFetch(input, init);
 	await handleResponse(res);
 	return res.json();
 };
 
 export const proxy = async (input: RequestInfo | URL, init?: RequestInit) => {
-	const res = await fetch(API_BASE + input, init);
+	const res = await apiFetch(input, init);
 	await handleResponse(res);
 	return res;
 };
 
 export async function requestDelete<T>(url: string, { arg }: { arg: T }) {
-	const res = await fetch(`${API_BASE}${url}/${arg}`, { method: 'DELETE' });
+	const res = await apiFetch(`${url}/${arg}`, { method: 'DELETE' });
 	await handleResponse(res);
 	return res;
 }
 
 export async function put<T>(url: string, { arg }: { arg: T }) {
-	const res = await fetch(`${API_BASE}${url}`, {
+	const res = await apiFetch(url, {
 		method: 'PUT',
 		headers: { 'Content-Type': 'application/json' },
 		body: JSON.stringify(arg),
@@ -138,12 +142,35 @@ export interface LivePreviewInfo {
 	danmaku: boolean;
 	/** 浏览器能否直连 CDN 拉这一路（全局配置 preview_transport = direct 时用；不能则回落中转并显示原因） */
 	direct: DirectCapability;
+	/** 此刻经 biliup 中转在看这一路的预览连接数（直连 CDN 的不算）；旧版后端没有这个字段 */
+	subscribers?: number;
+	/** 这一路的中转预览路数上限；满了新打开的预览会接替最早的一路 */
+	max_subscribers?: number;
 }
 
 export interface DirectCapability {
 	capable: boolean;
 	/** 不能直连的原因；capable 为 true 时为 null */
 	reason: string | null;
+}
+
+/** 马赛克区域配置 */
+export interface MosaicRegion {
+	id: string;
+	x: number;      // 归一化坐标 0-1
+	y: number;
+	width: number;
+	height: number;
+	effectType: 'mosaic' | 'blur' | 'solid';
+	strength: number; // 马赛克块大小 (4-64) 或模糊半径 (1-100)
+	color?: string | null;   // 纯色遮挡的颜色
+}
+
+/** 完整的马赛克配置 */
+export interface MosaicConfig {
+	enabled: boolean;
+	regions: MosaicRegion[];
+	mode?: string | null; // 后端保留的可选处理模式
 }
 
 /** GET /v1/streamers/{id}/live-url：正在录制的那条流的 CDN 直链 */
@@ -176,19 +203,27 @@ export interface LiveStreamerEntity {
 	upload_status?: string;
 	/** 录制中最近一个滑动窗口的写盘速率（字节/秒）；未录制 / 尚无采样 / 下载器不支持时为 null */
 	live_bytes_per_sec?: number | null;
+	/** 平台返回的主播名，独立于用户填写的录播备注；未录制 / 平台未提供时为 null */
+	live_streamer_name?: string | null;
 	/** 录制中的直播间封面地址；图片请走 /v1/streamers/{id}/cover 代理 */
 	live_cover_url?: string | null;
 	/** 录制中的主播头像地址；图片请走 /v1/streamers/{id}/avatar 代理 */
 	live_avatar_url?: string | null;
 	/** 录制中的预览能力；未录制为 null */
 	preview?: LivePreviewInfo | null;
+	/** 正在录的场次（切片工作台）；未录制或第一个分段还没开写时为 null */
+	session_id?: number | null;
+	/** 正在录的这一场已经打了几个标记；session_id 为 null 时也为 null */
+	marker_count?: number | null;
+	/** 「下播后自动生成候选」的当前值（只读）；没配置自动切片或没有 clip.edit 时没有这个键 */
+	auto_clip_after_live?: boolean;
 	statusTag?: React.ReactNode;
 	format?: string;
     time_range?: string | Date[];
     excluded_keywords?: string[];
 	preprocessor?: Record<'run', string>[];
-	segment_processor?: Record<'run', string>[];
-	downloaded_processor?: Record<'run', string>[];
+	segment_processor?: unknown[];
+	downloaded_processor?: { run: string; json?: boolean }[];
 	postprocessor?: (Record<'run' | 'mv', string> | 'rm')[];
 	opt_args?: string[];
 	override?: Record<string, any>;
@@ -238,6 +273,9 @@ export interface FileList {
 	name: string;
 	updateTime: number;
 	size: number;
+	/** 属于某一场、能按场次回看时才有：场次 id 和这一段在场次时间轴上的起点（毫秒） */
+	session_id?: number;
+	segment_start_ms?: number;
 }
 
 export interface StreamerInfo {
@@ -248,4 +286,6 @@ export interface StreamerInfo {
 	/** Unix 时间戳（秒），由后端 ts_seconds 序列化 */
 	date: number;
 	live_cover_path: string;
+	/** 这一场有时间轴，能在回看页打开（升级前录的场次没有） */
+	has_timeline?: boolean;
 }

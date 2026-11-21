@@ -18,6 +18,10 @@ pub struct LivePreviewResponse {
     pub danmaku: bool,
     /// 浏览器能否直连 CDN 拉这一路（`preview_transport = direct` 时前端据此选直连或回落中转）
     pub direct: DirectCapability,
+    /// 此刻占着这一路槽位的中转预览连接数（`GET /v1/streamers/{id}/live`；直连 CDN 的不算）
+    pub subscribers: usize,
+    /// 这一路的中转预览槽位数；满了新打开的预览会挤掉最早的一条。不可预览时为 0
+    pub max_subscribers: usize,
 }
 
 /// 浏览器直连 CDN 的能力判定（按平台 CDN 的跨域放行与并发策略实测得出）。
@@ -37,6 +41,8 @@ impl LivePreviewResponse {
             reason: status.reason,
             danmaku,
             direct,
+            subscribers: status.subscribers,
+            max_subscribers: status.max_subscribers,
         }
     }
 }
@@ -57,10 +63,20 @@ pub struct LiveStreamerResponse {
     /// 正在录制时最近一个滑动窗口内的写盘速率（字节/秒）。
     /// 未录制、尚无采样、或下载器不经过本进程写盘（边录边传、yt-dlp）时为 `null`。
     pub live_bytes_per_sec: Option<u64>,
+    /// 平台返回的主播名，与用户填写的录播备注 `remark` 独立；未录制或平台未提供时为 `null`。
+    pub live_streamer_name: Option<String>,
     /// 正在录制的直播间封面地址；图片本身请走 `GET /v1/streamers/{id}/cover` 代理。
     pub live_cover_url: Option<String>,
     /// 正在录制的主播头像地址；图片本身请走 `GET /v1/streamers/{id}/avatar` 代理。
     pub live_avatar_url: Option<String>,
     /// 正在录制时的预览能力；未录制为 `null`。视频流走 `GET /v1/streamers/{id}/live`。
     pub preview: Option<LivePreviewResponse>,
+    /// 正在录的场次（切片工作台）；未录制或第一个分段还没开写时为 `null`。
+    pub session_id: Option<i64>,
+    /// 正在录的这一场已经打了几个标记；`session_id` 为 `null` 时也为 `null`。
+    pub marker_count: Option<i64>,
+    /// 「下播后自动生成候选」（覆写里的 `auto_clip_after_live`）的当前值，只读：改它仍要改覆写、需要
+    /// `streamer.hooks`。没配置自动切片、或调用者没有 `clip.edit` 时不出现。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auto_clip_after_live: Option<bool>,
 }

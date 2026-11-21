@@ -1,5 +1,4 @@
-//! Shared entry point for the native `biliup` binary and the Python
-//! `stream_gears.main_loop` wrapper, so both parse, log and dispatch the same way.
+//! Native CLI entry point: argument parsing, logging and command dispatch.
 
 use std::ffi::OsString;
 use std::path::PathBuf;
@@ -19,6 +18,7 @@ use crate::LogHandle;
 use crate::cli::{Cli, Commands, expand_path};
 use crate::downloader::{download, generate_json};
 use crate::server::errors::{AppError, AppResult};
+use crate::server::fleet::FleetOptions;
 use crate::uploader::{
     append, comments, list, login, renew, reply, show, upload_by_command, upload_by_config,
 };
@@ -88,7 +88,7 @@ pub fn init_tracing(cli: &Cli) -> Logging {
 }
 
 /// Installs the global subscriber on the first call. Later calls in the same
-/// process (e.g. `main_loop` called twice) keep the existing layers and only
+/// process keep the existing layers and only
 /// swap the filter.
 pub fn init_tracing_with(filter: &str, log_file: bool) -> Logging {
     if let Some(handle) = LOG_HANDLE.get() {
@@ -215,6 +215,9 @@ pub async fn dispatch(cli: Cli, log_handle: LogHandle) -> AppResult<()> {
             auth,
             secure_session_cookie,
             config,
+            controller,
+            relay_listen,
+            relay_url,
         } => {
             serve(ServeOptions {
                 bind,
@@ -228,10 +231,17 @@ pub async fn dispatch(cli: Cli, log_handle: LogHandle) -> AppResult<()> {
                 listener: None,
                 shutdown: None,
                 ffmpeg: None,
+                render_tools_dir: None,
+                fleet: FleetOptions {
+                    controller,
+                    relay_listen,
+                    relay_urls: relay_url,
+                },
             })
             .await?
         }
         Commands::User { action } => crate::web_user_cli::run(action).await?,
+        Commands::Node { action } => crate::node_cli::run(action).await?,
         Commands::Season(args) => crate::season_cli::run(args, user_cookie, proxy).await?,
         Commands::List {
             is_pubing,
@@ -277,6 +287,13 @@ pub struct ServeOptions {
     /// An ffmpeg shipped with the host (the desktop app passes the one in its
     /// installer). Used when the `ffmpeg_path` setting is empty, before `PATH`.
     pub ffmpeg: Option<PathBuf>,
+    /// Render tools directory shipped with the host: the `fonts/` shared by
+    /// the danmaku preview and FFmpeg. (Danmaku conversion is built in.)
+    pub render_tools_dir: Option<PathBuf>,
+    /// Fleet controller options (`--controller`, `--relay-listen`, `--relay-url`).
+    /// By default the controller is ready while local recording stays unmanaged;
+    /// existing `data/node.json` or a join ticket selects the node role instead.
+    pub fleet: FleetOptions,
 }
 
 /// Runs the Web server until shutdown. It only needs a tokio runtime, so an
@@ -290,6 +307,7 @@ pub async fn serve(opts: ServeOptions) -> AppResult<()> {
             .attach_with(|| format!("could not switch to work dir {}", dir.display()))?;
     }
     crate::tools::set_bundled_ffmpeg(opts.ffmpeg);
+    crate::tools::set_bundled_render_tools(opts.render_tools_dir);
     let listener = match opts.listener {
         Some(listener) => listener
             .set_nonblocking(true)
@@ -304,6 +322,7 @@ pub async fn serve(opts: ServeOptions) -> AppResult<()> {
         opts.log_handle,
         opts.config,
         opts.user_cookie,
+        opts.fleet,
         opts.shutdown,
     )
     .await
