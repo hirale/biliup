@@ -35,6 +35,7 @@ use pipeline_common::{
 };
 use std::path::PathBuf;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, RwLock};
 #[cfg(test)]
 use std::time::Duration;
@@ -47,7 +48,16 @@ const CHANNEL_SIZE: usize = 64;
 /// 视频断流阈值（流时间）：音频照常推进而视频停住这么久，就结束本次拉流，
 /// 让下载循环重新解析直链重连。正常流里音视频交错，相差只有几十毫秒。
 /// 2026-10-03 B 站 CDN 重连后只下发音频，flv-fix 只打 WARN，白录了两个多小时。
-const VIDEO_STALL_MS: u32 = 10_000;
+///
+/// 按本场连续断流次数取值。前两次很快重连：CDN 节点出错时换直链就能恢复。
+/// 2026-11-03 连续十几次重连都只有音频，说明源头也没有画面，这时 10 秒一段的
+/// 分段全被 filter_size 删掉，连音频都留不下；所以之后拉长到 15 分钟一段
+/// （约 34 MB 音频，过得了默认的 20 MB 过滤），保住音频，同时定期换直链重试。
+const VIDEO_STALL_LADDER_MS: [u32; 4] = [10_000, 10_000, 60_000, 900_000];
+
+/// 视频帧连续推进这么久（流时间）才算画面恢复，清零断流计数。
+/// CDN 每次重连都会先回放约 8 秒的 GOP 缓存，不能据此判定恢复。
+const VIDEO_RECOVERED_MS: u32 = 60_000;
 
 /// writer 线程回传的分段事件。开段与关段走同一条通道，回调看到的顺序与落盘顺序一致。
 #[derive(Debug)]
@@ -63,6 +73,8 @@ type PreviewTee<I> = (PreviewSink, fn(&mut PreviewSink, &I));
 /// mesio 下载器实例。可跨多次 `download` 复用，每次调用使用新的取消令牌。
 pub struct Mesio {
     token: RwLock<CancellationToken>,
+    /// 本场录制里连续因视频断流结束拉流的次数，跨重连保留，决定下一次的断流阈值。
+    video_stalls: Arc<AtomicU32>,
 }
 
 impl Default for Mesio {
@@ -75,6 +87,7 @@ impl Mesio {
     pub fn new() -> Self {
         Self {
             token: RwLock::new(CancellationToken::new()),
+            video_stalls: Arc::new(AtomicU32::new(0)),
         }
     }
 
@@ -166,7 +179,7 @@ impl Mesio {
                     handle,
                 } = session;
                 let event_task = tokio::spawn(log_events(events));
-                let items = stop_on_video_stall(items)
+                let items = stop_on_video_stall(items, self.video_stalls.clone())
                     .map(|r| r.map_err(|e| PipelineError::Strategy(Box::new(e))));
                 let preview = download_config.preview.attach(PreviewFormat::Flv);
                 let outcome = run_pipeline::<FlvPipeline, _>(
@@ -483,33 +496,59 @@ where
 
 /// 视频断流时提前结束 FLV 输入流。管线照常收尾、关闭当前分段，下载器返回
 /// `StreamEnded`，房间仍在直播时下载循环会立即重新解析直链。
-fn stop_on_video_stall<S, E>(items: S) -> impl Stream<Item = Result<FlvData, E>>
+fn stop_on_video_stall<S, E>(
+    items: S,
+    stalls: Arc<AtomicU32>,
+) -> impl Stream<Item = Result<FlvData, E>>
 where
     S: Stream<Item = Result<FlvData, E>>,
 {
-    let mut guard = VideoStallGuard::default();
+    let mut guard = VideoStallGuard::new(stalls);
     items.take_while(move |item| future::ready(!matches!(item, Ok(data) if guard.stalled(data))))
 }
 
-/// 按流时间判定视频断流。从未出现过视频帧的流（纯音频直播）不会触发。
-#[derive(Default)]
+/// 按流时间判定视频断流。
+///
+/// 出现过视频 tag（含序列头）就认为这路流应当有画面：2026-11-03 那次重连拿到的流
+/// 只有一个 AVC 序列头、没有一帧画面，只认视频帧的旧判定因此一直没触发。
+/// 从头到尾没有任何视频 tag 的流（纯音频直播）不会触发。
 struct VideoStallGuard {
-    seen_video: bool,
-    /// 最近一个视频帧之后第一个音频 tag 的时间戳
+    stalls: Arc<AtomicU32>,
+    threshold_ms: u32,
+    expects_video: bool,
+    /// 本次拉流第一个视频帧的时间戳
+    first_video: Option<u32>,
+    recovered: bool,
+    /// 最近一个视频帧之后（或还没有视频帧时）第一个音频 tag 的时间戳
     audio_since_video: Option<u32>,
 }
 
 impl VideoStallGuard {
+    fn new(stalls: Arc<AtomicU32>) -> Self {
+        let n = stalls.load(Ordering::Relaxed) as usize;
+        let threshold_ms = VIDEO_STALL_LADDER_MS[n.min(VIDEO_STALL_LADDER_MS.len() - 1)];
+        Self {
+            stalls,
+            threshold_ms,
+            expects_video: false,
+            first_video: None,
+            recovered: false,
+            audio_since_video: None,
+        }
+    }
+
     fn stalled(&mut self, item: &FlvData) -> bool {
         let FlvData::Tag(tag) = item else {
             return false;
         };
-        if tag.is_video_tag() && !tag.is_video_sequence_header() {
-            self.seen_video = true;
-            self.audio_since_video = None;
+        if tag.is_video_tag() {
+            self.expects_video = true;
+            if !tag.is_video_sequence_header() {
+                self.on_video_frame(tag.timestamp_ms);
+            }
             return false;
         }
-        if !tag.is_audio_tag() || !self.seen_video {
+        if !tag.is_audio_tag() || !self.expects_video {
             return false;
         }
         let now = tag.timestamp_ms;
@@ -517,9 +556,12 @@ impl VideoStallGuard {
             // 时间戳回退（流内重置）时重新起算，宁可晚判也不误判
             Some(start) if now >= start => {
                 let stalled_ms = now - start;
-                if stalled_ms >= VIDEO_STALL_MS {
+                if stalled_ms >= self.threshold_ms {
+                    let stalls = self.stalls.fetch_add(1, Ordering::Relaxed) + 1;
                     warn!(
                         stalled_ms,
+                        stalls,
+                        saw_video_frame = self.first_video.is_some(),
                         "视频已停止而音频仍在推进，结束本次拉流以重新解析直链"
                     );
                     return true;
@@ -528,6 +570,18 @@ impl VideoStallGuard {
             _ => self.audio_since_video = Some(now),
         }
         false
+    }
+
+    fn on_video_frame(&mut self, ts: u32) {
+        self.audio_since_video = None;
+        let first = *self.first_video.get_or_insert(ts);
+        if !self.recovered && ts >= first && ts - first >= VIDEO_RECOVERED_MS {
+            self.recovered = true;
+            let previous = self.stalls.swap(0, Ordering::Relaxed);
+            if previous > 0 {
+                info!(stalls = previous, "视频画面已恢复，断流计数清零");
+            }
+        }
     }
 }
 
@@ -1049,9 +1103,13 @@ mod tests {
             items.push(audio(ts));
         }
         let total = items.len();
-        let kept: Vec<_> = stop_on_video_stall(stream::iter(items.into_iter().map(Ok::<_, ()>)))
-            .collect()
-            .await;
+        let stalls = Arc::new(AtomicU32::new(0));
+        let kept: Vec<_> = stop_on_video_stall(
+            stream::iter(items.into_iter().map(Ok::<_, ()>)),
+            stalls.clone(),
+        )
+        .collect()
+        .await;
         assert!(kept.len() < total);
         let FlvData::Tag(last) = kept.last().unwrap().as_ref().unwrap() else {
             panic!("expected a tag");
@@ -1062,27 +1120,74 @@ mod tests {
             "{}",
             last.timestamp_ms
         );
+        assert_eq!(stalls.load(Ordering::Relaxed), 1);
+    }
+
+    fn fresh_guard() -> VideoStallGuard {
+        VideoStallGuard::new(Arc::new(AtomicU32::new(0)))
     }
 
     #[test]
     fn video_stall_guard_ignores_healthy_and_audio_only_streams() {
-        let mut guard = VideoStallGuard::default();
+        let mut guard = fresh_guard();
+        assert!(!guard.stalled(&video_sequence_header(0)));
         for ts in (0..120_000).step_by(33) {
             assert!(!guard.stalled(&video(ts)));
             assert!(!guard.stalled(&audio(ts)));
         }
 
-        // 纯音频直播，或只有视频序列头没有视频帧：不算见过视频
-        let mut guard = VideoStallGuard::default();
-        assert!(!guard.stalled(&video_sequence_header(0)));
+        // 纯音频直播：没有任何视频 tag
+        let mut guard = fresh_guard();
         for ts in (0..120_000).step_by(23) {
             assert!(!guard.stalled(&audio(ts)));
         }
     }
 
+    /// 2026-11-03 的形态：重连后只有视频序列头，没有一帧画面，之后全是音频。
+    #[test]
+    fn video_stall_guard_fires_when_only_a_sequence_header_arrives() {
+        let mut guard = fresh_guard();
+        assert!(!guard.stalled(&video_sequence_header(1)));
+        assert!(!guard.stalled(&audio(0)));
+        assert!(!guard.stalled(&audio(9_990)));
+        assert!(guard.stalled(&audio(10_000)));
+    }
+
+    #[test]
+    fn video_stall_threshold_grows_with_consecutive_stalls_and_resets_on_recovery() {
+        let stalls = Arc::new(AtomicU32::new(0));
+        let fire_at = |stalls: &Arc<AtomicU32>| {
+            let mut guard = VideoStallGuard::new(stalls.clone());
+            assert!(!guard.stalled(&video_sequence_header(0)));
+            (0..2_000_000)
+                .step_by(23)
+                .find(|&ts| guard.stalled(&audio(ts)))
+                .unwrap()
+        };
+        let thresholds: Vec<u32> = (0..6).map(|_| fire_at(&stalls)).collect();
+        assert_eq!(
+            thresholds.iter().map(|t| t / 1_000).collect::<Vec<_>>(),
+            vec![10, 10, 60, 900, 900, 900]
+        );
+        assert_eq!(stalls.load(Ordering::Relaxed), 6);
+
+        // GOP 缓存那几秒视频不算恢复
+        let mut guard = VideoStallGuard::new(stalls.clone());
+        for ts in (0..8_000).step_by(33) {
+            assert!(!guard.stalled(&video(ts)));
+        }
+        assert_eq!(stalls.load(Ordering::Relaxed), 6);
+        // 画面持续一分钟才清零
+        for ts in (8_000..61_000).step_by(33) {
+            assert!(!guard.stalled(&video(ts)));
+        }
+        assert_eq!(stalls.load(Ordering::Relaxed), 0);
+        assert_eq!(fire_at(&stalls) / 1_000, 10);
+    }
+
     #[test]
     fn video_stall_guard_restarts_on_audio_timestamp_reset() {
-        let mut guard = VideoStallGuard::default();
+        let mut guard = fresh_guard();
         assert!(!guard.stalled(&video(500_000)));
         assert!(!guard.stalled(&audio(500_000)));
         assert!(!guard.stalled(&audio(509_000)));
