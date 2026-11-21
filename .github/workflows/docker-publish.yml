@@ -5,6 +5,8 @@ on:
     # Publish `master` as Docker `latest` image.
     branches:
       - master
+      # Upstream merge branches build a branch-tagged image before they reach master.
+      - 'merge/**'
 
     # Publish `v1.2.3` tags as releases.
     tags:
